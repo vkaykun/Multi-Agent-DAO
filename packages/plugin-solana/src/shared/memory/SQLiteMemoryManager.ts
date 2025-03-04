@@ -1,12 +1,12 @@
 import { IMemoryManager, Memory, UUID, IAgentRuntime, ServiceType, Service, elizaLogger, stringToUuid } from "@elizaos/core";
-import { MemoryQueryOptions } from "../types/memory";
+import { MemoryQueryOptions } from "../types/memory.ts";
 import * as Database from "better-sqlite3";
-import { Transaction, BaseContent } from "../types/base";
+import { Transaction, BaseContent } from "../types/base.ts";
 import { EventEmitter } from "events";
-import { BaseMemoryManager } from "./BaseMemoryManager";
-import { isUniqueMemoryType, UNIQUE_MEMORY_TYPES, isVersionedMemoryType } from "../types/base";
-import { MemoryEvent } from "../types/memory-events";
-import { MessageBroker } from "../MessageBroker";
+import { BaseMemoryManager, VersionHistory } from "./BaseMemoryManager.ts";
+import { isUniqueMemoryType, UNIQUE_MEMORY_TYPES, isVersionedMemoryType } from "../types/base.ts";
+import { MemoryEvent } from "../types/memory-events.ts";
+import { MessageBroker } from "../MessageBroker.ts";
 
 interface DBRow {
     id: string;
@@ -82,6 +82,7 @@ export class SQLiteMemoryManager extends BaseMemoryManager {
     private readonly WRITE_INTERVAL = 100;
     private currentTransaction: SQLiteTransaction | null = null;
     private queueProcessingPromise: Promise<void> = Promise.resolve();
+    private currentTransactionId: string | null = null;
 
     constructor(connectionString: string, runtime: IAgentRuntime, tableName: string) {
         super(runtime, { 
@@ -452,6 +453,8 @@ export class SQLiteMemoryManager extends BaseMemoryManager {
             CREATE INDEX IF NOT EXISTS ${this.tableName}_versions_id_idx ON ${this.tableName}_versions(id);
             CREATE INDEX IF NOT EXISTS ${this.tableName}_versions_created_idx ON ${this.tableName}_versions(created_at);
         `);
+
+        await this.initializeLockTable();
     }
 
     async addEmbeddingToMemory(memory: Memory): Promise<Memory> {
@@ -841,80 +844,185 @@ export class SQLiteMemoryManager extends BaseMemoryManager {
             throw new Error('Transaction already in progress');
         }
         this.currentTransaction = new SQLiteTransaction(this.db);
+        this.currentTransactionId = `tx-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     }
 
     protected async commitTransactionInternal(): Promise<void> {
         if (!this.currentTransaction) {
             throw new Error('No transaction in progress');
         }
-        await this.currentTransaction.commit();
-        this.currentTransaction = null;
+        try {
+            // Clean up locks for this transaction
+            const cleanupStmt = this.db.prepare(`
+                DELETE FROM memory_locks
+                WHERE transaction_id = ?
+            `);
+            cleanupStmt.run(this.currentTransactionId);
+
+            await this.currentTransaction.commit();
+        } finally {
+            this.currentTransaction = null;
+            this.currentTransactionId = null;
+        }
     }
 
     protected async rollbackTransactionInternal(): Promise<void> {
         if (!this.currentTransaction) {
             throw new Error('No transaction in progress');
         }
-        await this.currentTransaction.rollback();
-        this.currentTransaction = null;
-    }
+        try {
+            // Clean up locks for this transaction
+            if (this.currentTransactionId) {
+                const cleanupStmt = this.db.prepare(`
+                    DELETE FROM memory_locks
+                    WHERE transaction_id = ?
+                `);
+                cleanupStmt.run(this.currentTransactionId);
+            }
 
-    protected async searchMemoriesByEmbeddingInternal(
-        embedding: number[],
-        opts: { 
-            match_threshold?: number; 
-            count?: number; 
-            roomId: UUID; 
-            unique?: boolean;
-            query?: string;
+            await this.currentTransaction.rollback();
+        } finally {
+            this.currentTransaction = null;
+            this.currentTransactionId = null;
         }
-    ): Promise<Memory[]> {
-        // Register cosine similarity function if not exists
-        this.db.function('cosine_similarity', (a: Buffer, b: Buffer) => {
-            const vecA = new Float64Array(a.buffer);
-            const vecB = new Float64Array(b.buffer);
-            return this.calculateCosineSimilarity(Array.from(vecA), Array.from(vecB));
-        });
-
-        const embeddingBuffer = Buffer.from(new Float64Array(embedding).buffer);
-        
-        const stmt = this.db.prepare(
-            `SELECT *, cosine_similarity(embedding, ?) as similarity 
-             FROM ${this.tableName} 
-             WHERE room_id = ? 
-             AND embedding IS NOT NULL
-             HAVING similarity > ?
-             ORDER BY similarity DESC
-             LIMIT ?`
-        );
-
-        const rows = stmt.all(
-            embeddingBuffer,
-            opts.roomId,
-            opts.match_threshold || 0.8,
-            opts.count || 10
-        ) as DBRow[];
-
-        return rows.map(row => this.mapRowToMemory(row));
     }
 
-    protected async searchMemoriesByText(
-        roomId: UUID,
-        predicate: (memory: Memory) => boolean,
-        limit?: number
-    ): Promise<Memory[]> {
-        const stmt = this.db.prepare(
-            `SELECT * FROM ${this.tableName} 
-             WHERE room_id = ?
-             ORDER BY created_at DESC
-             ${limit ? 'LIMIT ?' : ''}`
-        );
+    /**
+     * Simulate row-level locking in SQLite using transactions.
+     * Note: SQLite doesn't support true row-level locks, so we use transactions
+     * to provide isolation.
+     */
+    public async getMemoryWithLock(id: UUID): Promise<Memory | null> {
+        if (!this.isInTransaction) {
+            throw new Error("getMemoryWithLock must be called within a transaction");
+        }
 
-        const params = limit ? [roomId, limit] : [roomId];
-        const rows = stmt.all(...params) as DBRow[];
-        const memories = rows.map(row => this.mapRowToMemory(row));
-        
-        return memories.filter(predicate);
+        try {
+            const stmt = this.db.prepare(`
+                SELECT m.*, e.embedding 
+                FROM ${this.tableName} m
+                LEFT JOIN embeddings e ON m.id = e.memory_id
+                WHERE m.id = ?
+            `);
+            
+            const row = stmt.get(id) as DBRow | undefined;
+            if (!row) {
+                return null;
+            }
+
+            // Parse JSON content and embeddings
+            const memory = this.mapRowToMemory(row);
+            
+            // Add a lock record to track this memory is being modified
+            const lockStmt = this.db.prepare(`
+                INSERT OR REPLACE INTO memory_locks (
+                    memory_id,
+                    locked_at,
+                    locked_by,
+                    transaction_id
+                ) VALUES (?, ?, ?, ?)
+            `);
+            
+            lockStmt.run(
+                id,
+                Date.now(),
+                this.runtime.agentId,
+                this.currentTransactionId
+            );
+
+            return memory;
+
+        } catch (error) {
+            elizaLogger.error(`Error in getMemoryWithLock for id ${id}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Simulate row-level locking for multiple memories in SQLite using transactions.
+     * Supports filtering and ordering by creation time.
+     */
+    public async getMemoriesWithLock(opts: {
+        roomId: UUID;
+        count: number;
+        filter?: Record<string, any>;
+    }): Promise<Memory[]> {
+        if (!this.isInTransaction) {
+            throw new Error("getMemoriesWithLock must be called within a transaction");
+        }
+
+        try {
+            let query = `
+                SELECT m.*, e.embedding 
+                FROM ${this.tableName} m
+                LEFT JOIN embeddings e ON m.id = e.memory_id
+                WHERE m.room_id = ?
+            `;
+            const params: any[] = [opts.roomId];
+
+            // Add filter conditions if provided
+            if (opts.filter) {
+                for (const [key, value] of Object.entries(opts.filter)) {
+                    if (key === 'type' && typeof value === 'string') {
+                        query += ` AND json_extract(m.content, '$.type') = ?`;
+                        params.push(value);
+                    } else if (key === 'status' && typeof value === 'string') {
+                        query += ` AND json_extract(m.content, '$.status') = ?`;
+                        params.push(value);
+                    } else if (key === 'agentId' && typeof value === 'string') {
+                        query += ` AND json_extract(m.content, '$.agentId') = ?`;
+                        params.push(value);
+                    }
+                }
+            }
+
+            query += `
+                ORDER BY m.created_at DESC
+                LIMIT ?
+            `;
+            params.push(opts.count);
+
+            const stmt = this.db.prepare(query);
+            const rows = stmt.all(...params) as DBRow[];
+
+            // Add lock records for all retrieved memories
+            const lockStmt = this.db.prepare(`
+                INSERT OR REPLACE INTO memory_locks (
+                    memory_id,
+                    locked_at,
+                    locked_by,
+                    transaction_id
+                ) VALUES (?, ?, ?, ?)
+            `);
+
+            const now = Date.now();
+            for (const row of rows) {
+                lockStmt.run(
+                    row.id,
+                    now,
+                    this.runtime.agentId,
+                    this.currentTransactionId
+                );
+            }
+
+            return rows.map(row => this.mapRowToMemory(row));
+
+        } catch (error) {
+            elizaLogger.error(`Error in getMemoriesWithLock for room ${opts.roomId}:`, error);
+            throw error;
+        }
+    }
+
+    // Add helper method to initialize lock tracking table
+    protected async initializeLockTable(): Promise<void> {
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS memory_locks (
+                memory_id TEXT PRIMARY KEY,
+                locked_at INTEGER NOT NULL,
+                locked_by TEXT NOT NULL,
+                transaction_id TEXT NOT NULL
+            )
+        `);
     }
 
     private startPeriodicCheckpoint(): void {
@@ -929,56 +1037,83 @@ export class SQLiteMemoryManager extends BaseMemoryManager {
     }
 
     async getMemoryVersions(id: UUID): Promise<Memory[]> {
-        const stmt = this.db.prepare(
-            `SELECT * FROM ${this.tableName}_versions 
-             WHERE id = ? 
-             ORDER BY version DESC`
-        );
-
-        const rows = await this.withRetry<DBRow[]>(() => {
-            const result = stmt.all(id);
-            return result as DBRow[];
-        });
-
-        return rows.map(row => this.mapRowToMemory(row));
+        const query = `
+            SELECT id, version, content, created_at
+            FROM ${this.tableName}_versions
+            WHERE id = ?
+            ORDER BY version DESC
+        `;
+        
+        const stmt = this.db.prepare(query);
+        const rows = stmt.all(id) as Array<{
+            id: string;
+            version: number;
+            content: string;
+            created_at: number;
+        }>;
+        return rows.map(row => ({
+            id: row.id as UUID,
+            content: JSON.parse(row.content),
+            roomId: JSON.parse(row.content).roomId,
+            userId: JSON.parse(row.content).userId,
+            agentId: JSON.parse(row.content).agentId,
+            createdAt: row.created_at
+        }));
     }
 
-    async getMemoryVersion(id: UUID, version: number): Promise<Memory | null> {
-        const stmt = this.db.prepare(
-            `SELECT * FROM ${this.tableName}_versions 
-             WHERE id = ? AND version = ?`
-        );
+    protected async searchMemoriesByEmbeddingInternal(
+        embedding: number[],
+        opts: {
+            match_threshold?: number;
+            count?: number;
+            roomId: UUID;
+            unique?: boolean;
+            query?: string;
+        }
+    ): Promise<Memory[]> {
+        return this.searchMemoriesByEmbedding(embedding, opts);
+    }
 
-        const row = await this.withRetry<DBRow>(() => {
-            const result = stmt.get(id, version);
-            return result as DBRow;
-        });
-
-        return row ? this.mapRowToMemory(row) : null;
+    protected async searchMemoriesByText(
+        roomId: UUID,
+        predicate: (memory: Memory) => boolean,
+        limit?: number
+    ): Promise<Memory[]> {
+        const memories = await this.getMemories({ domain: roomId, count: limit });
+        return memories.filter(predicate);
     }
 
     protected async getMemoryInternal(id: UUID): Promise<Memory | null> {
-        const row = this.db.prepare(`SELECT * FROM ${this.tableName} WHERE id = ?`).get(id) as DBRow | undefined;
-        return row ? this.mapRowToMemory(row) : null;
+        return this.getMemoryById(id);
     }
 
     protected async updateMemoryInternal(memory: Memory): Promise<void> {
-        const stmt = this.db.prepare(
-            `UPDATE ${this.tableName} 
-             SET content = ?, updated_at = ?
-             WHERE id = ?`
-        );
-        await this.withRetry(() =>
-            stmt.run(
-                JSON.stringify(memory.content),
-                Date.now(),
-                memory.id
-            )
-        );
+        const stmt = this.db.prepare(`
+            UPDATE ${this.tableName}
+            SET content = ?, updated_at = ?
+            WHERE id = ?
+        `);
+        await stmt.run(JSON.stringify(memory.content), Date.now(), memory.id);
     }
 
     protected async removeMemoryInternal(id: UUID): Promise<void> {
-        const stmt = this.db.prepare(`DELETE FROM ${this.tableName} WHERE id = ?`);
-        await this.withRetry(() => stmt.run(id));
+        await this.removeMemory(id);
+    }
+
+    protected async storeVersionHistory(version: VersionHistory): Promise<void> {
+        const stmt = this.db.prepare(`
+            INSERT INTO ${this.tableName}_versions (id, version, content, created_at)
+            VALUES (?, ?, ?, ?)
+        `);
+        await stmt.run(version.id, version.version, JSON.stringify(version.content), version.createdAt);
+    }
+
+    public async getMemoryVersion(id: UUID, version: number): Promise<Memory | null> {
+        const stmt = this.db.prepare(`
+            SELECT * FROM ${this.tableName}_versions
+            WHERE id = ? AND version = ?
+        `);
+        const row = stmt.get(id, version) as DBRow | undefined;
+        return row ? this.mapRowToMemory(row) : null;
     }
 }

@@ -100,35 +100,16 @@ const summarizeAction = {
         if (message.content.source !== "discord") {
             return false;
         }
-        // only show if one of the keywords are in the message
-        const keywords: string[] = [
-            "attachment",
-            "summary",
-            "summarize",
-            "research",
-            "pdf",
-            "video",
-            "audio",
-            "image",
-            "document",
-            "link",
-            "file",
-            "attachment",
-            "summarize",
-            "code",
-            "report",
-            "write",
-            "details",
-            "information",
-            "talk",
-            "chat",
-            "read",
-            "listen",
-            "watch",
-        ];
-        return keywords.some((keyword) =>
-            message.content.text.toLowerCase().includes(keyword.toLowerCase())
-        );
+
+        // Check if there are actual attachments
+        const hasAttachments = message.content.attachments && message.content.attachments.length > 0;
+        
+        // Check if it's an explicit request to handle attachments
+        const explicitRequest = message.content.text.toLowerCase().includes("summarize") || 
+                              message.content.text.toLowerCase().includes("attachment");
+        
+        // Only trigger if there are attachments or an explicit request
+        return hasAttachments || explicitRequest;
     },
     handler: async (
         runtime: IAgentRuntime,

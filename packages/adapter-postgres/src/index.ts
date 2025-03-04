@@ -1,3 +1,5 @@
+// packages/adapter-postgres/src/index.ts
+
 import { v4 } from "uuid";
 
 // Import the entire module as default
@@ -8,7 +10,7 @@ type PoolClient = pg.PoolClient;
 import {
     type Account,
     type Actor,
-    DatabaseAdapter,
+    IDatabaseAdapter,
     EmbeddingProvider,
     type GoalStatus,
     type Participant,
@@ -20,6 +22,7 @@ import {
     type Memory,
     type Relationship,
     type UUID,
+    stringToUuid,
 } from "@elizaos/core";
 import fs from "fs";
 import path from "path";
@@ -31,21 +34,71 @@ import type {
 } from "pg";
 import { fileURLToPath } from "url";
 
+class CircuitBreaker {
+    private state: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
+    private failureCount = 0;
+    private lastFailureTime = 0;
+
+    constructor(private config: {
+        failureThreshold: number;
+        resetTimeout: number;
+        halfOpenMaxAttempts: number;
+    }) {}
+
+    async execute<T>(operation: () => Promise<T>): Promise<T> {
+        if (this.state === 'OPEN') {
+            if (Date.now() - this.lastFailureTime >= this.config.resetTimeout) {
+                this.state = 'HALF_OPEN';
+            } else {
+                throw new Error('Circuit breaker is OPEN');
+            }
+        }
+
+        try {
+            const result = await operation();
+            if (this.state === 'HALF_OPEN') {
+                this.state = 'CLOSED';
+                this.failureCount = 0;
+            }
+            return result;
+        } catch (error) {
+            this.failureCount++;
+            this.lastFailureTime = Date.now();
+            
+            if (this.failureCount >= this.config.failureThreshold) {
+                this.state = 'OPEN';
+            }
+            throw error;
+        }
+    }
+
+    getState(): string {
+        return this.state;
+    }
+}
+
 const __filename = fileURLToPath(import.meta.url); // get the resolved path to the file
 const __dirname = path.dirname(__filename); // get the name of the directory
 
-interface IPostgresDatabaseAdapter extends IDatabaseCacheAdapter {
-    beginTransaction(): Promise<PoolClient>;
+export interface IPostgresDatabaseAdapter extends IDatabaseAdapter {
+    query<R extends QueryResultRow = any, I = any[]>(
+        queryTextOrConfig: string | QueryConfig<I>,
+        values?: QueryConfigValues<I>
+    ): Promise<QueryResult<R>>;
+    
+    removeMemoryWithTransaction(id: UUID, tableName: string, transaction: PoolClient): Promise<void>;
+    
+    // Add transaction methods
+    beginTransaction(): Promise<void>;
     commitTransaction(): Promise<void>;
     rollbackTransaction(): Promise<void>;
-    createMemoryWithTransaction(memory: Memory, tableName: string, transaction: PoolClient): Promise<void>;
-    removeMemoryWithTransaction(id: UUID, tableName: string, transaction: PoolClient): Promise<void>;
+    setIsolationLevel(level: string): Promise<void>;
 }
 
 export class PostgresDatabaseAdapter
-    extends DatabaseAdapter<Pool>
     implements IPostgresDatabaseAdapter
 {
+    db: Pool;
     private pool: Pool;
     private currentTransaction: PoolClient | null = null;
     private readonly maxRetries: number = 3;
@@ -53,15 +106,9 @@ export class PostgresDatabaseAdapter
     private readonly maxDelay: number = 10000; // 10 seconds
     private readonly jitterMax: number = 1000; // 1 second
     private readonly connectionTimeout: number = 5000; // 5 seconds
+    private circuitBreaker: CircuitBreaker;
 
     constructor(connectionConfig: any) {
-        super({
-            //circuitbreaker stuff
-            failureThreshold: 5,
-            resetTimeout: 60000,
-            halfOpenMaxAttempts: 3,
-        });
-
         const defaultConfig = {
             max: 20,
             idleTimeoutMillis: 30000,
@@ -70,7 +117,13 @@ export class PostgresDatabaseAdapter
 
         this.pool = new pg.Pool({
             ...defaultConfig,
-            ...connectionConfig, // Allow overriding defaults
+            ...connectionConfig,
+        });
+        this.db = this.pool;
+        this.circuitBreaker = new CircuitBreaker({
+            failureThreshold: 5,
+            resetTimeout: 60000,
+            halfOpenMaxAttempts: 3,
         });
 
         this.pool.on("error", (err) => {
@@ -304,11 +357,19 @@ export class PostgresDatabaseAdapter
 
     async getRoom(roomId: UUID): Promise<UUID | null> {
         return this.withDatabase(async () => {
-            const { rows } = await this.pool.query(
-                "SELECT id FROM rooms WHERE id = $1",
-                [roomId]
-            );
-            return rows.length > 0 ? (rows[0].id as UUID) : null;
+            try {
+                const { rows } = await this.pool.query(
+                    'SELECT id FROM rooms WHERE id = $1',
+                    [roomId]
+                );
+                return rows.length > 0 ? (rows[0].id as UUID) : null;
+            } catch (error) {
+                elizaLogger.error("Error getting room:", {
+                    error: error instanceof Error ? error.message : String(error),
+                    roomId
+                });
+                throw error;
+            }
         }, "getRoom");
     }
 
@@ -618,9 +679,15 @@ export class PostgresDatabaseAdapter
         start?: number;
         end?: number;
     }): Promise<Memory[]> {
-        // Parameter validation
+        // Parameter validation - handle missing roomId gracefully if embeddings are disabled
         if (!params.tableName) throw new Error("tableName is required");
-        if (!params.roomId) throw new Error("roomId is required");
+        if (!params.roomId) {
+            if (process.env.DISABLE_EMBEDDINGS === 'true') {
+                elizaLogger.warn("Missing roomId in getMemories with embeddings disabled, returning empty array");
+                return [];
+            }
+            throw new Error("roomId is required");
+        }
 
         return this.withDatabase(async () => {
             // Build query
@@ -797,11 +864,20 @@ export class PostgresDatabaseAdapter
 
     async createRoom(roomId?: UUID): Promise<UUID> {
         return this.withDatabase(async () => {
-            const newRoomId = roomId || v4();
-            await this.pool.query("INSERT INTO rooms (id) VALUES ($1)", [
-                newRoomId,
-            ]);
-            return newRoomId as UUID;
+            try {
+                const newRoomId = roomId || stringToUuid(v4());
+                await this.pool.query(
+                    'INSERT INTO rooms (id, created_at) VALUES ($1, CURRENT_TIMESTAMP)',
+                    [newRoomId]
+                );
+                return newRoomId;
+            } catch (error) {
+                elizaLogger.error("Error creating room:", {
+                    error: error instanceof Error ? error.message : String(error),
+                    roomId
+                });
+                throw error;
+            }
         }, "createRoom");
     }
 
@@ -1820,32 +1896,16 @@ export class PostgresDatabaseAdapter
         );
     }
 
-    async beginTransaction(): Promise<PoolClient> {
-        if (this.currentTransaction) {
-            throw new Error('Transaction already in progress');
-        }
-        const client = await this.pool.connect();
-        await client.query('BEGIN');
-        this.currentTransaction = client;
-        return client;
+    async beginTransaction(): Promise<void> {
+        await this.query('BEGIN');
     }
 
     async commitTransaction(): Promise<void> {
-        if (!this.currentTransaction) {
-            throw new Error('No transaction in progress');
-        }
-        await this.currentTransaction.query('COMMIT');
-        this.currentTransaction.release();
-        this.currentTransaction = null;
+        await this.query('COMMIT');
     }
 
     async rollbackTransaction(): Promise<void> {
-        if (!this.currentTransaction) {
-            throw new Error('No transaction in progress');
-        }
-        await this.currentTransaction.query('ROLLBACK');
-        this.currentTransaction.release();
-        this.currentTransaction = null;
+        await this.query('ROLLBACK');
     }
 
     async createMemoryWithTransaction(memory: Memory, tableName: string, transaction: PoolClient): Promise<void> {
@@ -1862,6 +1922,104 @@ export class PostgresDatabaseAdapter
             values: [id]
         };
         await transaction.query(query);
+    }
+
+    async getMemoriesWithPagination(params: {
+        roomId: UUID;
+        limit?: number;
+        cursor?: UUID;
+        startTime?: number;
+        endTime?: number;
+        tableName: string;
+        agentId: UUID;
+    }): Promise<{ items: Memory[]; hasMore: boolean; nextCursor?: UUID }> {
+        return this.withDatabase(async () => {
+            const limit = params.limit || 10;
+            const conditions = ['type = $1', 'roomId = $2'];
+            const values: any[] = [params.tableName, params.roomId];
+            let paramIndex = 3;
+
+            if (params.agentId) {
+                conditions.push(`agentId = $${paramIndex}`);
+                values.push(params.agentId);
+                paramIndex++;
+            }
+
+            if (params.cursor) {
+                conditions.push(`id > $${paramIndex}`);
+                values.push(params.cursor);
+                paramIndex++;
+            }
+
+            if (params.startTime) {
+                conditions.push(`createdAt >= to_timestamp($${paramIndex})`);
+                values.push(params.startTime);
+                paramIndex++;
+            }
+
+            if (params.endTime) {
+                conditions.push(`createdAt <= to_timestamp($${paramIndex})`);
+                values.push(params.endTime);
+                paramIndex++;
+            }
+
+            const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+            const query = `
+                SELECT *
+                FROM memories
+                ${whereClause}
+                ORDER BY id
+                LIMIT ${limit + 1}
+            `;
+
+            const { rows } = await this.pool.query(query, values);
+            const hasMore = rows.length > limit;
+            const items = rows.slice(0, limit).map(row => ({
+                ...row,
+                content: typeof row.content === 'string' ? JSON.parse(row.content) : row.content
+            }));
+            const nextCursor = hasMore ? items[items.length - 1].id : undefined;
+
+            return {
+                items,
+                hasMore,
+                nextCursor
+            };
+        }, "getMemoriesWithPagination");
+    }
+
+    async setIsolationLevel(level: string): Promise<void> {
+        await this.query(`SET TRANSACTION ISOLATION LEVEL ${level}`);
+    }
+
+    protected async withCircuitBreaker<T>(
+        operation: () => Promise<T>,
+        context: string
+    ): Promise<T> {
+        try {
+            return await this.circuitBreaker.execute(operation);
+        } catch (error) {
+            elizaLogger.error(`Circuit breaker error in ${context}:`, error);
+            throw error;
+        }
+    }
+
+    async updateMemory(memory: Memory, tableName: string): Promise<void> {
+        return this.withDatabase(async () => {
+            await this.pool.query(
+                `UPDATE memories 
+                SET content = $1, 
+                    embedding = $2,
+                    "updatedAt" = CURRENT_TIMESTAMP 
+                WHERE id = $3 AND type = $4`,
+                [
+                    JSON.stringify(memory.content),
+                    memory.embedding ? `[${memory.embedding.join(",")}]` : null,
+                    memory.id,
+                    tableName
+                ]
+            );
+        }, "updateMemory");
     }
 }
 

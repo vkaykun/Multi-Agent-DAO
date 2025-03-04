@@ -12,9 +12,17 @@ import {
     type RAGKnowledgeItem,
     elizaLogger,
 } from "@elizaos/core";
-import { DatabaseAdapter } from "@elizaos/core";
+import { IDatabaseAdapter } from "@elizaos/core";
 import { v4 as uuid } from "uuid";
-export class SupabaseDatabaseAdapter extends DatabaseAdapter {
+export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
+    db: SupabaseClient;
+    supabase: SupabaseClient;
+
+    constructor(supabaseUrl: string, supabaseKey: string) {
+        this.supabase = createClient(supabaseUrl, supabaseKey);
+        this.db = this.supabase;
+    }
+
     async getRoom(roomId: UUID): Promise<UUID | null> {
         const { data, error } = await this.supabase
             .from("rooms")
@@ -93,13 +101,6 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
         }
 
         return data.map((row) => row.userId as UUID);
-    }
-
-    supabase: SupabaseClient;
-
-    constructor(supabaseUrl: string, supabaseKey: string) {
-        super();
-        this.supabase = createClient(supabaseUrl, supabaseKey);
     }
 
     async init() {
@@ -952,6 +953,97 @@ export class SupabaseDatabaseAdapter extends DatabaseAdapter {
                 );
                 throw error;
             }
+        }
+    }
+
+    async beginTransaction(): Promise<void> {
+        // Supabase doesn't support explicit transaction management through the client
+        // Each query is automatically wrapped in a transaction
+    }
+
+    async commitTransaction(): Promise<void> {
+        // Supabase doesn't support explicit transaction management through the client
+        // Each query is automatically wrapped in a transaction
+    }
+
+    async rollbackTransaction(): Promise<void> {
+        // Supabase doesn't support explicit transaction management through the client
+        // Each query is automatically wrapped in a transaction
+    }
+
+    async getMemoriesWithPagination(params: {
+        roomId: UUID;
+        limit?: number;
+        cursor?: UUID;
+        startTime?: number;
+        endTime?: number;
+        tableName: string;
+        agentId: UUID;
+    }): Promise<{
+        items: Memory[];
+        hasMore: boolean;
+        nextCursor?: UUID;
+    }> {
+        let query = this.supabase
+            .from(params.tableName)
+            .select("*")
+            .eq("roomId", params.roomId)
+            .eq("agentId", params.agentId)
+            .order("createdAt", { ascending: false });
+
+        if (params.cursor) {
+            const cursorMemory = await this.supabase
+                .from(params.tableName)
+                .select("createdAt")
+                .eq("id", params.cursor)
+                .single();
+
+            if (cursorMemory.data) {
+                query = query.lt("createdAt", cursorMemory.data.createdAt);
+            }
+        }
+
+        if (params.startTime) {
+            query = query.gte("createdAt", new Date(params.startTime).toISOString());
+        }
+
+        if (params.endTime) {
+            query = query.lte("createdAt", new Date(params.endTime).toISOString());
+        }
+
+        const limit = params.limit || 10;
+        query = query.limit(limit + 1);
+
+        const { data, error } = await query;
+
+        if (error) {
+            elizaLogger.error("Error retrieving memories with pagination:", error);
+            return { items: [], hasMore: false };
+        }
+
+        const hasMore = data.length > limit;
+        const items = hasMore ? data.slice(0, -1) : data;
+        const nextCursor = hasMore ? items[items.length - 1].id as UUID : undefined;
+
+        return {
+            items: items as Memory[],
+            hasMore,
+            nextCursor
+        };
+    }
+
+    async query(sql: string, params?: any[]): Promise<{ rows: any[] }> {
+        throw new Error("Raw SQL queries are not supported in the Supabase adapter");
+    }
+
+    async updateMemory(memory: Memory, tableName: string): Promise<void> {
+        const { error } = await this.supabase
+            .from(tableName)
+            .update(memory)
+            .eq('id', memory.id);
+        
+        if (error) {
+            throw new Error(`Error updating memory: ${error.message}`);
         }
     }
 }

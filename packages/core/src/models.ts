@@ -7,6 +7,15 @@ import {
     type Models,
     type ModelSettings,
 } from "./types.ts";
+import elizaLogger from "./logger.ts";
+
+// Add logging for environment variables
+elizaLogger.info("OpenAI model environment variables:", {
+    SMALL_OPENAI_MODEL: settings.SMALL_OPENAI_MODEL || "not set",
+    MEDIUM_OPENAI_MODEL: settings.MEDIUM_OPENAI_MODEL || "not set",
+    LARGE_OPENAI_MODEL: settings.LARGE_OPENAI_MODEL || "not set",
+    EMBEDDING_OPENAI_MODEL: settings.EMBEDDING_OPENAI_MODEL || "not set"
+});
 
 // Helper function to parse token limits
 const parseTokenLimit = (value: string | undefined, defaultValue: number): number => {
@@ -20,7 +29,7 @@ export const models: Models = {
         endpoint: settings.OPENAI_API_URL || "https://api.openai.com/v1",
         model: {
             [ModelClass.SMALL]: {
-                name: settings.SMALL_OPENAI_MODEL || "gpt-4o-mini",
+                name: settings.SMALL_OPENAI_MODEL || "gpt-3.5-turbo",
                 stop: [],
                 maxInputTokens: parseTokenLimit(settings.OPENAI_MAX_INPUT_TOKENS as string, 128000),
                 maxOutputTokens: parseTokenLimit(settings.OPENAI_MAX_OUTPUT_TOKENS as string, 4096),
@@ -29,7 +38,7 @@ export const models: Models = {
                 temperature: 0.6,
             },
             [ModelClass.MEDIUM]: {
-                name: settings.MEDIUM_OPENAI_MODEL || "gpt-4o",
+                name: settings.MEDIUM_OPENAI_MODEL || "gpt-4",
                 stop: [],
                 maxInputTokens: parseTokenLimit(settings.OPENAI_MAX_INPUT_TOKENS as string, 128000),
                 maxOutputTokens: parseTokenLimit(settings.OPENAI_MAX_OUTPUT_TOKENS as string, 4096),
@@ -38,7 +47,7 @@ export const models: Models = {
                 temperature: 0.6,
             },
             [ModelClass.LARGE]: {
-                name: settings.LARGE_OPENAI_MODEL || "gpt-4o",
+                name: settings.LARGE_OPENAI_MODEL || "gpt-4",
                 stop: [],
                 maxInputTokens: parseTokenLimit(settings.OPENAI_MAX_INPUT_TOKENS as string, 128000),
                 maxOutputTokens: parseTokenLimit(settings.OPENAI_MAX_OUTPUT_TOKENS as string, 4096),
@@ -47,9 +56,8 @@ export const models: Models = {
                 temperature: 0.6,
             },
             [ModelClass.EMBEDDING]: {
-                name:
-                    settings.EMBEDDING_OPENAI_MODEL || "text-embedding-3-small",
-                dimensions: 1536,
+                name: settings.EMBEDDING_OPENAI_MODEL || "text-embedding-ada-002",
+                dimensions: 1536  // OpenAI's ada-002 model always returns 1536 dimensions
             },
             [ModelClass.IMAGE]: {
                 name: settings.IMAGE_OPENAI_MODEL || "dall-e-3",

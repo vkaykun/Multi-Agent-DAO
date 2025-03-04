@@ -1,12 +1,10 @@
 export * from "./sqliteTables.ts";
-export * from "./types.ts";
 
 import {
     type Account,
     type Actor,
-    DatabaseAdapter,
+    type IDatabaseAdapter,
     type GoalStatus,
-    type IDatabaseCacheAdapter,
     type Participant,
     type Goal,
     type Memory,
@@ -17,15 +15,76 @@ import {
 } from "@elizaos/core";
 import { v4 } from "uuid";
 import { sqliteTables } from "./sqliteTables.ts";
-import type { Database } from "./types.ts";
+import type { Database, SqlValue } from "sql.js";
 
-export class SqlJsDatabaseAdapter
-    extends DatabaseAdapter<Database>
-    implements IDatabaseCacheAdapter
-{
+type ParamsObject = Record<string, SqlValue>;
+
+class CircuitBreaker {
+    private state: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
+    private failureCount = 0;
+    private lastFailureTime = 0;
+
+    constructor(private config: {
+        failureThreshold: number;
+        resetTimeout: number;
+        halfOpenMaxAttempts: number;
+    }) {}
+
+    async execute<T>(operation: () => Promise<T>): Promise<T> {
+        if (this.state === 'OPEN') {
+            if (Date.now() - this.lastFailureTime >= this.config.resetTimeout) {
+                this.state = 'HALF_OPEN';
+            } else {
+                throw new Error('Circuit breaker is OPEN');
+            }
+        }
+
+        try {
+            const result = await operation();
+            if (this.state === 'HALF_OPEN') {
+                this.state = 'CLOSED';
+                this.failureCount = 0;
+            }
+            return result;
+        } catch (error) {
+            this.failureCount++;
+            this.lastFailureTime = Date.now();
+            
+            if (this.failureCount >= this.config.failureThreshold) {
+                this.state = 'OPEN';
+            }
+            throw error;
+        }
+    }
+
+    getState(): string {
+        return this.state;
+    }
+}
+
+export class SqlJsDatabaseAdapter implements IDatabaseAdapter {
+    db: Database;
+    private circuitBreaker: CircuitBreaker;
+
     constructor(db: Database) {
-        super();
         this.db = db;
+        this.circuitBreaker = new CircuitBreaker({
+            failureThreshold: 5,
+            resetTimeout: 60000,
+            halfOpenMaxAttempts: 3
+        });
+    }
+
+    protected async withCircuitBreaker<T>(
+        operation: () => Promise<T>,
+        context: string
+    ): Promise<T> {
+        try {
+            return await this.circuitBreaker.execute(operation);
+        } catch (error) {
+            elizaLogger.error(`Circuit breaker error in ${context}:`, error);
+            throw error;
+        }
     }
 
     async init() {
@@ -1043,6 +1102,118 @@ export class SqlJsDatabaseAdapter
 
         const stmt = this.db.prepare(sql);
         stmt.run([agentId]);
+        stmt.free();
+    }
+
+    async beginTransaction(): Promise<void> {
+        await this.db.exec('BEGIN TRANSACTION');
+    }
+
+    async commitTransaction(): Promise<void> {
+        await this.db.exec('COMMIT');
+    }
+
+    async rollbackTransaction(): Promise<void> {
+        await this.db.exec('ROLLBACK');
+    }
+
+    async getMemoriesWithPagination(params: {
+        roomId: UUID;
+        limit?: number;
+        cursor?: UUID;
+        startTime?: number;
+        endTime?: number;
+        tableName: string;
+        agentId: UUID;
+    }): Promise<{
+        items: Memory[];
+        hasMore: boolean;
+        nextCursor?: UUID;
+    }> {
+        const values: SqlValue[] = [];
+        const limit = params.limit || 10;  // Default limit if undefined
+        let query = `
+            SELECT *
+            FROM ${params.tableName}
+            WHERE room_id = ?
+        `;
+        values.push(params.roomId);
+
+        if (params.startTime !== undefined) {
+            query += ' AND created_at >= ?';
+            values.push(params.startTime.toString());
+        }
+
+        if (params.endTime !== undefined) {
+            query += ' AND created_at <= ?';
+            values.push(params.endTime.toString());
+        }
+
+        if (params.agentId !== undefined) {
+            query += ' AND agent_id = ?';
+            values.push(params.agentId);
+        }
+
+        query += ' ORDER BY created_at DESC';
+        query += ' LIMIT ?';
+        values.push(limit.toString());
+
+        if (params.cursor !== undefined) {
+            query += ' AND id > ?';  // Using ID-based pagination instead of offset
+            values.push(params.cursor);
+        }
+
+        const results = this.db.exec(query, values);
+        const memories: Memory[] = results[0]?.values.map((row: any) => ({
+            id: row[0],
+            roomId: row[1],
+            agentId: row[2],
+            userId: row[3],
+            content: row[4],
+            createdAt: new Date(row[5]).getTime(),
+            updatedAt: new Date(row[6]).getTime()
+        })) || [];
+
+        const hasMore = memories.length === limit;
+        const items = memories.slice(0, limit);
+        const nextCursor = hasMore ? items[items.length - 1].id : undefined;
+
+        return {
+            items,
+            hasMore,
+            nextCursor
+        };
+    }
+
+    async query(sql: string, params?: any[]): Promise<{ rows: any[] }> {
+        const paramsObj: ParamsObject = {};
+        if (params) {
+            params.forEach((value, index) => {
+                paramsObj[`$${index + 1}`] = value;
+            });
+        }
+        const results = this.db.exec(sql, paramsObj);
+        return { rows: results[0]?.values || [] };
+    }
+
+    async updateMemory(memory: Memory, tableName: string): Promise<void> {
+        if (!memory.id) {
+            throw new Error("Memory ID is required for update");
+        }
+
+        const sql = `UPDATE memories 
+            SET content = ?, 
+                embedding = ?,
+                "updatedAt" = CURRENT_TIMESTAMP 
+            WHERE id = ? AND type = ?`;
+        
+        const stmt = this.db.prepare(sql);
+        stmt.run([
+            JSON.stringify(memory.content),
+            memory.embedding ? JSON.stringify(memory.embedding) : null,
+            memory.id.toString(),
+            tableName
+        ]);
         stmt.free();
     }
 }

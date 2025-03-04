@@ -1,3 +1,5 @@
+// BaseMemoryManager.ts
+
 import {
     AgentType,
     AgentState,
@@ -8,22 +10,22 @@ import {
     DAOEventType,
     DAOEvent,
     Transaction,
-    REQUIRED_MEMORY_TYPES,
     UNIQUE_MEMORY_TYPES,
     isUniqueMemoryType,
     isVersionedMemoryType,
     MemoryMetadata
-} from "../types/base";
+} from "../types/base.ts";
+import { MEMORY_SUBSCRIPTIONS } from "../types/memory-subscriptions.ts";
 import { UUID, IAgentRuntime, elizaLogger, stringToUuid, ServiceType, Service, IMemoryManager } from "@elizaos/core";
-import { Memory, MemorySubscription } from "../types/memory-types";
-import { MemoryQueryOptions } from "../types/memory";
-import { MessageBroker } from "../MessageBroker";
-import { MemoryEvent } from "../types/memory-events";
-import { EmbeddingService } from "../services/EmbeddingService";
+import { Memory, MemorySubscription } from "../types/memory-types.ts";
+import { MemoryQueryOptions } from "../types/memory.ts";
+import { MessageBroker } from "../MessageBroker.ts";
+import { MemoryEvent } from "../types/memory-events.ts";
+import { EmbeddingService } from "../services/EmbeddingService.ts";
 import * as Database from "better-sqlite3";
 import { EventEmitter } from "events";
-import { getMemoryRoom } from "../constants";
-import { MemorySyncManager } from "./MemorySyncManager";
+import { getMemoryRoom } from "../constants.ts";
+import { MemorySyncManager } from "./MemorySyncManager.ts";
 
 export interface PaginatedResult<T> {
     items: T[];
@@ -53,6 +55,30 @@ export interface MemoryManagerOptions {
     tableName: string;
 }
 
+// Add version control interfaces
+interface VersionedMemory extends Memory {
+    version: number;
+    latestVersion?: number;
+    updatedAt: number;
+}
+
+export interface VersionHistory {
+    id: UUID;
+    version: number;
+    content: BaseContent;
+    createdAt: number;
+    reason?: string;
+}
+
+export interface UniqueKeys {
+    type: string;
+    [key: string]: string | number | boolean;
+}
+
+export interface MemoryWithUniqueKeys extends Memory {
+    uniqueKeys?: UniqueKeys;
+}
+
 /**
  * Abstract base class for memory management implementations.
  * Provides common functionality and defines the contract for concrete implementations.
@@ -64,6 +90,8 @@ export abstract class BaseMemoryManager implements IMemoryManager {
     protected readonly MAX_PAGE_SIZE = 100;
     protected useEmbeddings: boolean;
     protected _isInTransaction: boolean = false;
+    protected transactionLevel: number = 0;
+    protected savepointCounter: number = 0;
     protected messageBroker: MessageBroker;
     protected memorySyncManager: MemorySyncManager;
     protected memorySubscriptions: Map<string, Set<MemorySubscription["callback"]>>;
@@ -86,9 +114,15 @@ export abstract class BaseMemoryManager implements IMemoryManager {
     }
 
     private setupCrossProcessEvents(): void {
-        this.messageBroker.subscribe("memory_created", (event: MemoryEvent) => {
+        this.messageBroker.subscribe("memory_created", async (event: MemoryEvent) => {
             if (event.agentId !== this.runtime.agentId) {
-                this.notifySubscribers(event);
+                await this.notifySubscribers(event);
+            }
+        });
+
+        this.messageBroker.subscribe("memory_updated", async (event: MemoryEvent) => {
+            if (event.agentId !== this.runtime.agentId) {
+                await this.notifySubscribers(event);
             }
         });
     }
@@ -210,13 +244,112 @@ export abstract class BaseMemoryManager implements IMemoryManager {
     protected abstract checkUniqueness(memory: Memory): Promise<boolean>;
 
     /**
-     * Creates a memory with proper validation and uniqueness checks
+     * Checks and enforces uniqueness constraints for a memory
+     * This is the single source of truth for memory uniqueness
      */
-    async createMemory(memory: Memory, unique?: boolean): Promise<void> {
-        await this.createMemoryInternal(memory, unique);
+    protected async checkAndEnforceUnique(memory: Memory): Promise<void> {
+        const content = memory.content as BaseContent;
+        if (isUniqueMemoryType(content.type)) {
+            const exists = await this.checkUniqueness(memory);
+            if (exists) {
+                throw new Error("Memory with these constraints already exists");
+            }
+        }
+    }
+
+    public async updateMemoryWithVersion(id: UUID, update: Partial<Memory>, expectedVersion: number): Promise<boolean> {
+        const current = await this.getMemoryWithLock(id);
+        if (!current || !current.content || (current.content as any).version !== expectedVersion) {
+            return false;
+        }
+        const currentMetadata = typeof current.content.metadata === 'object' ? current.content.metadata : {};
+        const updateMetadata = typeof update.content?.metadata === 'object' ? update.content.metadata : {};
         
-        // Broadcast memory creation for sync
-        this.messageBroker.emit("memory_created", memory);
+        await this.updateMemory({
+            ...current,
+            ...update,
+            content: {
+                ...current.content,
+                ...update.content,
+                metadata: {
+                    ...currentMetadata,
+                    ...updateMetadata,
+                    version: expectedVersion + 1,
+                    versionTimestamp: Date.now()
+                }
+            }
+        });
+        return true;
+    }
+
+    /**
+     * Pre-create hook for memory validation and processing
+     */
+    protected async preCreateHook(memory: Memory): Promise<void> {
+        const content = memory.content as BaseContent;
+        
+        // Validate required fields
+        if (!content.type || !content.text) {
+            throw new Error('Memory content must have type and text fields');
+        }
+
+        // Enforce uniqueness constraints
+        await this.checkAndEnforceUnique(memory);
+
+        // Add timestamps if not present
+        const now = Date.now();
+        if (!content.createdAt) content.createdAt = now;
+        if (!content.updatedAt) content.updatedAt = now;
+    }
+
+    /**
+     * Checks if a memory with given unique keys already exists
+     */
+    protected async getMemoryByUniqueKeys(uniqueKeys: UniqueKeys): Promise<Memory | null> {
+        const conditions = Object.entries(uniqueKeys).map(([key, value]) => {
+            if (key === 'type') {
+                return `content->>'type' = $1`;
+            }
+            return `content->'metadata'->>'${key}' = $${Object.keys(uniqueKeys).indexOf(key) + 1}`;
+        });
+
+        const query = `
+            SELECT * FROM ${this.tableName}
+            WHERE ${conditions.join(' AND ')}
+            LIMIT 1
+        `;
+
+        const result = await this.runtime.databaseAdapter.query(
+            query,
+            Object.values(uniqueKeys)
+        );
+
+        return result.rows[0] || null;
+    }
+
+    /**
+     * Creates a memory with uniqueness constraints
+     */
+    async createMemory(memory: MemoryWithUniqueKeys, unique = false): Promise<void> {
+        if (memory.uniqueKeys) {
+            const existing = await this.getMemoryByUniqueKeys(memory.uniqueKeys);
+            if (existing) {
+                throw new Error(
+                    `Memory with unique keys ${JSON.stringify(memory.uniqueKeys)} already exists (id: ${existing.id})`
+                );
+            }
+        }
+
+        // Add uniqueKeys to metadata if provided
+        if (memory.uniqueKeys) {
+            const content = memory.content as BaseContent;
+            content.metadata = {
+                ...content.metadata,
+                ...memory.uniqueKeys
+            };
+        }
+
+        await this.createMemoryInternal(memory, unique);
     }
 
     /**
@@ -334,11 +467,14 @@ export abstract class BaseMemoryManager implements IMemoryManager {
     }): Promise<Memory[]>;
 
     async beginTransaction(): Promise<void> {
-        if (this._isInTransaction) {
-            elizaLogger.warn("Transaction already in progress, skipping nested transaction");
-            return;
+        // If this is the very first transaction, mark isInTransaction = true
+        // Otherwise, we'll rely on the transactionLevel to track nested savepoints
+        this.transactionLevel++;
+        if (this.transactionLevel === 1) {
+            this._isInTransaction = true;
         }
-        this._isInTransaction = true;
+        // Always call beginTransactionInternal so that derived classes (like PostgresMemoryManager)
+        // can handle either a top-level BEGIN or a new SAVEPOINT.
         await this.beginTransactionInternal();
     }
 
@@ -347,8 +483,16 @@ export abstract class BaseMemoryManager implements IMemoryManager {
             elizaLogger.warn("No active transaction to commit");
             return;
         }
+
+        // Let the derived class do a COMMIT or RELEASE SAVEPOINT:
         await this.commitTransactionInternal();
-        this._isInTransaction = false;
+
+        // If we've decremented back to zero, we're fully committed.
+        this.transactionLevel--;
+        if (this.transactionLevel <= 0) {
+            this._isInTransaction = false;
+            this.transactionLevel = 0;
+        }
     }
 
     async rollbackTransaction(): Promise<void> {
@@ -356,8 +500,16 @@ export abstract class BaseMemoryManager implements IMemoryManager {
             elizaLogger.warn("No active transaction to rollback");
             return;
         }
+
+        // Let the derived class do a ROLLBACK or ROLLBACK TO SAVEPOINT:
         await this.rollbackTransactionInternal();
-        this._isInTransaction = false;
+
+        // Decrement and check if we fully left a transaction
+        this.transactionLevel--;
+        if (this.transactionLevel <= 0) {
+            this._isInTransaction = false;
+            this.transactionLevel = 0;
+        }
     }
 
     protected abstract beginTransactionInternal(): Promise<void>;
@@ -451,7 +603,7 @@ export abstract class BaseMemoryManager implements IMemoryManager {
         const memories = await this.getMemoriesInternal({
             domain: this.runtime.agentId,
             timestamp: this.lastSyncTimestamp,
-            types: Object.values(REQUIRED_MEMORY_TYPES).flat()
+            types: Object.keys(MEMORY_SUBSCRIPTIONS)
         });
 
         for (const memory of memories) {
@@ -467,7 +619,7 @@ export abstract class BaseMemoryManager implements IMemoryManager {
     protected async processMemory(memory: Memory): Promise<void> {
         const content = memory.content as BaseContent;
         
-        // Broadcast memory created event to ensure all subscribers are notified
+        // Single point of event emission
         await this.broadcastMemoryChange({
             type: "memory_created",
             content,
@@ -475,6 +627,17 @@ export abstract class BaseMemoryManager implements IMemoryManager {
             agentId: this.runtime.agentId,
             timestamp: Date.now()
         });
+
+        // Also emit content-type specific event for subscribers
+        if (content.type) {
+            await this.notifySubscribers({
+                type: content.type,
+                content,
+                roomId: memory.roomId,
+                agentId: this.runtime.agentId,
+                timestamp: Date.now()
+            });
+        }
     }
 
     async getMemory(id: UUID): Promise<Memory | null> {
@@ -491,4 +654,184 @@ export abstract class BaseMemoryManager implements IMemoryManager {
     protected abstract getMemoryInternal(id: UUID): Promise<Memory | null>;
     protected abstract updateMemoryInternal(memory: Memory): Promise<void>;
     protected abstract removeMemoryInternal(id: UUID): Promise<void>;
-} 
+
+    /**
+     * Retrieve a single memory row with a row-level lock (FOR UPDATE).
+     * Must be overridden by concrete implementations if lock-based concurrency is required.
+     * @param id The UUID of the memory to retrieve and lock
+     * @returns The memory object with a lock, or null if not found
+     * @throws Error if not implemented by concrete class
+     */
+    public async getMemoryWithLock(id: UUID): Promise<Memory | null> {
+        throw new Error("getMemoryWithLock not implemented in BaseMemoryManager");
+    }
+
+    /**
+     * Retrieve multiple memories with row-level locks (FOR UPDATE).
+     * Must be overridden by concrete implementations if lock-based concurrency is required.
+     * @param options Query options including roomId, count, and optional filter
+     * @returns Array of memory objects with locks
+     * @throws Error if not implemented by concrete class
+     */
+    public async getMemoriesWithLock(options: {
+        roomId: UUID;
+        count: number;
+        filter?: Record<string, any>;
+    }): Promise<Memory[]> {
+        throw new Error("getMemoriesWithLock not implemented in BaseMemoryManager");
+    }
+
+    /**
+     * Gets the latest version of a memory with row-level locking
+     */
+    public async getLatestVersionWithLock(id: UUID): Promise<Memory | null> {
+        if (!this.isInTransaction) {
+            throw new Error("getLatestVersionWithLock must be called within a transaction");
+        }
+        const memory = await this.getMemoryWithLock(id);
+        if (!memory) return null;
+        return memory;
+    }
+
+    /**
+     * Creates a new version of a memory while maintaining proper version control
+     */
+    protected async createNewVersion(
+        currentMemory: VersionedMemory,
+        updates: Partial<BaseContent>,
+        reason?: string
+    ): Promise<void> {
+        if (!this.isInTransaction) {
+            throw new Error("createNewVersion must be called within a transaction");
+        }
+
+        const content = currentMemory.content as BaseContent;
+        const newVersion = (currentMemory.latestVersion || 1) + 1;
+
+        // First store the current version in history
+        await this.storeVersionHistory({
+            id: currentMemory.id,
+            version: currentMemory.version,
+            content: content,
+            createdAt: content.createdAt,
+            reason: reason || 'Update'
+        });
+
+        // Then update the main record with new version
+        const updatedContent: BaseContent = {
+            ...content,
+            ...updates,
+            metadata: {
+                ...content.metadata,
+                version: newVersion,
+                latestVersion: newVersion,
+                versionTimestamp: Date.now(),
+                versionReason: reason
+            },
+            updatedAt: Date.now()
+        };
+
+        await this.updateMemoryInternal({
+            ...currentMemory,
+            content: updatedContent
+        });
+    }
+
+    /**
+     * Stores a version in the history table
+     */
+    protected abstract storeVersionHistory(version: VersionHistory): Promise<void>;
+
+    /**
+     * Gets all versions of a memory
+     */
+    public abstract getMemoryVersions(id: UUID): Promise<Memory[]>;
+
+    /**
+     * Gets a specific version of a memory
+     */
+    public abstract getMemoryVersion(id: UUID, version: number): Promise<Memory | null>;
+
+    public async updateMemory(memory: Memory): Promise<void> {
+        const content = memory.content as BaseContent;
+        if (!content || !content.type || typeof content.type !== 'string') {
+            throw new Error("Invalid memory content");
+        }
+
+        await this.beginTransaction();
+        try {
+            // First validate and prepare the memory
+            const preparedMemory = await this.validateAndPrepareMemory(memory);
+            const preparedContent = preparedMemory.content as BaseContent;
+            
+            // Perform the update
+            await this.updateMemoryInternal(preparedMemory);
+            
+            // Broadcast the update event
+            await this.broadcastMemoryChange({
+                type: "memory_updated",
+                content: preparedContent,
+                roomId: preparedMemory.roomId,
+                agentId: this.runtime.agentId,
+                timestamp: Date.now(),
+                memory: preparedMemory
+            });
+
+            // Also emit content-type specific event for subscribers
+            await this.notifySubscribers({
+                type: preparedContent.type,
+                content: preparedContent,
+                roomId: preparedMemory.roomId,
+                agentId: this.runtime.agentId,
+                timestamp: Date.now(),
+                memory: preparedMemory
+            });
+
+            await this.commitTransaction();
+        } catch (error) {
+            await this.rollbackTransaction();
+            throw error;
+        }
+    }
+
+    /**
+     * Helper method to get memories with complex filtering
+     */
+    protected async getMemoriesWithFilter(options: {
+        roomId: UUID;
+        filter?: Record<string, unknown>;
+        count?: number;
+    }): Promise<Memory[]> {
+        const { roomId, filter, count = 100 } = options;
+        
+        // Start with base query
+        let query = `SELECT * FROM ${this.tableName} WHERE room_id = $1`;
+        const params: any[] = [roomId];
+        let paramIndex = 2;
+
+        // Add filter conditions if present
+        if (filter) {
+            if (filter.type) {
+                query += ` AND content->>'type' = $${paramIndex}`;
+                params.push(filter.type);
+                paramIndex++;
+            }
+
+            // Handle nested content fields
+            Object.entries(filter).forEach(([key, value]) => {
+                if (key === 'type') return; // Already handled
+                
+                if (key.includes('.')) {
+                    const [parent, child] = key.split('.');
+                    query += ` AND content->'${parent}'->>'${child}' = $${paramIndex}`;
+                    params.push(value);
+                    paramIndex++;
+                }
+            });
+        }
+
+        query += ` LIMIT ${count}`;
+        const result = await this.runtime.databaseAdapter.query(query, params);
+        return result.rows;
+    }
+}

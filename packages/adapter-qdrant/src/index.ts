@@ -4,33 +4,31 @@ import {
     Account,
     Actor,
     GoalStatus,
-    IDatabaseCacheAdapter,
+    IDatabaseAdapter,
     UUID,
     elizaLogger,
     RAGKnowledgeItem,
-    DatabaseAdapter,
     Participant,
     type Memory,
     type Goal,
     type Relationship,
 } from "@elizaos/core";
 
-
-export class QdrantDatabaseAdapter  extends DatabaseAdapter<QdrantClient>  implements IDatabaseCacheAdapter {
+export class QdrantDatabaseAdapter implements IDatabaseAdapter {
     db: QdrantClient;
     collectionName: string = 'collection';
     qdrantV5UUIDNamespace: string = "00000000-0000-0000-0000-000000000000";
     cacheM: Map<string, string> = new Map<string, string>();
     vectorSize: number;
+
     constructor(url: string, apiKey: string, port: number, vectorSize: number) {
-        super();
         elizaLogger.info("new Qdrant client...");
         this.db = new QdrantClient({
-                url: url,
-                apiKey:apiKey,
-                port: port,
+            url: url,
+            apiKey: apiKey,
+            port: port,
         });
-       this.vectorSize = vectorSize;
+        this.vectorSize = vectorSize;
     }
 
     private preprocess(content: string): string {
@@ -400,6 +398,59 @@ export class QdrantDatabaseAdapter  extends DatabaseAdapter<QdrantClient>  imple
 
     private buildQdrantID(id: string): string{
        return v5(id,this.qdrantV5UUIDNamespace);
+    }
+
+    async beginTransaction(): Promise<void> {
+        // Qdrant doesn't support transactions
+        return;
+    }
+
+    async commitTransaction(): Promise<void> {
+        // Qdrant doesn't support transactions
+        return;
+    }
+
+    async rollbackTransaction(): Promise<void> {
+        // Qdrant doesn't support transactions
+        return;
+    }
+
+    async getMemoriesWithPagination(params: {
+        roomId: UUID;
+        limit?: number;
+        cursor?: UUID;
+        startTime?: number;
+        endTime?: number;
+        tableName: string;
+        agentId: UUID;
+    }): Promise<{ items: Memory[]; hasMore: boolean; nextCursor?: UUID; }> {
+        const limit = params.limit || 10;
+        const memories = await this.getMemories({
+            roomId: params.roomId,
+            count: limit + 1,
+            tableName: params.tableName,
+            agentId: params.agentId
+        });
+
+        const hasMore = memories.length > limit;
+        const items = memories.slice(0, limit);
+        const nextCursor = hasMore ? items[items.length - 1].id : undefined;
+
+        return {
+            items,
+            hasMore,
+            nextCursor
+        };
+    }
+
+    async query(sql: string, params?: any[]): Promise<any> {
+        // Qdrant doesn't support SQL queries
+        throw new Error("Raw queries not supported in Qdrant adapter");
+    }
+
+    async updateMemory(memory: Memory, tableName: string): Promise<void> {
+        // Qdrant doesn't support direct memory updates
+        throw new Error("Memory updates not supported in Qdrant adapter");
     }
 }
 

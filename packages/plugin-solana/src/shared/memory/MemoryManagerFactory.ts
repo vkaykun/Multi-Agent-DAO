@@ -1,6 +1,6 @@
 import { IMemoryManager, IAgentRuntime, elizaLogger } from "@elizaos/core";
-import { PostgresMemoryManager } from "./PostgresMemoryManager";
-import { SQLiteMemoryManager } from "./SQLiteMemoryManager";
+import { PostgresMemoryManager } from "./PostgresMemoryManager.ts";
+import { SQLiteMemoryManager } from "./SQLiteMemoryManager.ts";
 
 export interface MemoryConfig {
     // Database-specific settings

@@ -1,7 +1,8 @@
 import { UUID } from "@elizaos/core";
-import { BaseContent } from "./base";
-import { TokenBalance } from "./treasury";
+import { BaseContent, MemoryMetadata } from "./base.ts";
+import { TokenBalance } from "./treasury.ts";
 
+// Base user profile interface that contains all common fields
 export interface UserProfile extends BaseContent {
     type: "user_profile";
     userId: UUID;
@@ -15,6 +16,22 @@ export interface UserProfile extends BaseContent {
     lastActive: number;
     createdAt: number;
     updatedAt: number;
+    // Add voting-related fields that were in vote.ts
+    proposalsCreated: number;
+    votesCount: number;
+    // Add metadata for tracking user stats
+    metadata?: MemoryMetadata & {
+        lastProposalId?: string;
+        lastVoteId?: string;
+        userStats?: {
+            proposalsCreated: number;
+            votesCount: number;
+            strategiesCreated?: number;
+            swapsExecuted?: number;
+            depositsProcessed?: number;
+            transfersProcessed?: number;
+        };
+    };
 }
 
 export interface UserProfileUpdate extends BaseContent {

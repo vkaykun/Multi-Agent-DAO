@@ -5,8 +5,8 @@ import {
     UUID,
     Memory
 } from "@elizaos/core";
-import { BaseContent } from "../types/base";
-import { getMemoryRoom, ROOM_IDS, MEMORY_ROOM_MAPPING } from "../constants";
+import { BaseContent } from "../types/base.ts";
+import { getMemoryRoom, ROOM_IDS, MEMORY_ROOM_MAPPING } from "../constants.ts";
 
 export interface CacheSubscriber<T = any> {
     pattern: string;

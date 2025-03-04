@@ -7,7 +7,16 @@
         "skipLibCheck": true,
         "moduleResolution": "bundler",
         "module": "ESNext",
-        "allowImportingTsExtensions": true
+        "allowImportingTsExtensions": true,
+        "allowArbitraryExtensions": true,
+        "customConditions": ["@elizaos/source"]
+    },
+    "ts-node": {
+        "esm": true,
+        "experimentalSpecifiers": true,
+        "moduleTypes": {
+            "**/*.ts": "esm"
+        }
     },
     "include": ["src/**/*.ts"],
     "exclude": ["node_modules", "dist", "**/*.test.ts"]

@@ -1,17 +1,26 @@
 import { IAgentRuntime, UUID, elizaLogger } from "@elizaos/core";
-import { ProposalContent } from "../types/proposal";
-import { findUniversalContent, queryUniversalContent, findContentById } from "./search";
-import { ROOM_IDS } from "../constants";
+import { ProposalContent } from "../types/proposal.ts";
+import { findUniversalContent, queryUniversalContent, findContentById } from "./search.ts";
+import { ROOM_IDS } from "../constants.ts";
+import { shortIdToUuid } from "../types/proposal.ts";
 
 /**
  * Finds a proposal by either its full UUID or short ID.
  * First attempts direct memory lookup, then falls back to room searches.
+ * @param runtime The agent runtime
+ * @param proposalIdentifier Either a short ID (e.g. "abc123") or a full UUID
+ * @returns The proposal content or null if not found
  */
 export async function findProposal(
     runtime: IAgentRuntime,
-    proposalId: UUID
+    proposalIdentifier: string
 ): Promise<ProposalContent | null> {
     try {
+        // Convert identifier to UUID - handle both short IDs and full UUIDs
+        const proposalId = proposalIdentifier.includes('-') 
+            ? proposalIdentifier as UUID 
+            : shortIdToUuid(proposalIdentifier);
+
         // Try direct memory lookup first
         const directMemory = await runtime.messageManager.getMemoryById(proposalId);
         if (directMemory && directMemory.content.type === "proposal") {
@@ -38,7 +47,7 @@ export async function findProposal(
             ROOM_IDS.PROPOSAL
         );
     } catch (error) {
-        elizaLogger.error(`Error finding proposal ${proposalId}:`, error);
+        elizaLogger.error(`Error finding proposal ${proposalIdentifier}:`, error);
         return null;
     }
 }

@@ -1,5 +1,5 @@
 import { elizaLogger, Memory, UUID } from "@elizaos/core";
-import { MessageBroker } from "../MessageBroker";
+import { MessageBroker } from "../MessageBroker.ts";
 import { EventEmitter } from "events";
 
 interface MemorySyncMessage {
@@ -8,6 +8,10 @@ interface MemorySyncMessage {
     memory: Memory;
     timestamp: number;
     processId: number;
+}
+
+interface SyncedMemory extends Memory {
+    syncTimestamp: number;
 }
 
 /**
@@ -19,13 +23,17 @@ export class MemorySyncManager extends EventEmitter {
     private static instance: MemorySyncManager;
     private messageBroker: MessageBroker;
     private lastSyncTimestamp: number = 0;
-    private recentMemories: Map<UUID, Memory> = new Map();
-    private readonly RECENT_MEMORY_TTL = 5 * 60 * 1000; // 5 minutes
+    private recentMemories: Map<string, SyncedMemory> = new Map();
+    private memorySyncCallbacks: Set<(memory: Memory) => Promise<void>>;
+    private memoryDeleteCallbacks: Set<(memoryId: string) => Promise<void>>;
+    private readonly RECENT_MEMORY_TTL = 60000; // 1 minute
 
     private constructor() {
         super();
         this.messageBroker = MessageBroker.getInstance();
-        this.setupProcessHandlers();
+        this.memorySyncCallbacks = new Set();
+        this.memoryDeleteCallbacks = new Set();
+        this.setupProcessMessageHandler();
         this.startCleanupInterval();
     }
 
@@ -36,99 +44,60 @@ export class MemorySyncManager extends EventEmitter {
         return MemorySyncManager.instance;
     }
 
-    private setupProcessHandlers(): void {
-        // Listen for messages from parent or child processes
-        process.on("message", (message: MemorySyncMessage) => {
-            if (message.type === "memory_sync") {
-                this.handleSyncMessage(message);
-            }
-        });
-
-        // Listen for memory events from MessageBroker
-        this.messageBroker.on("memory_created", (memory: Memory) => {
-            this.broadcastMemoryUpdate("create", memory);
-        });
-
-        this.messageBroker.on("memory_updated", (memory: Memory) => {
-            this.broadcastMemoryUpdate("update", memory);
-        });
-
-        this.messageBroker.on("memory_deleted", (memoryId: UUID) => {
-            const memory = this.recentMemories.get(memoryId);
-            if (memory) {
-                this.broadcastMemoryUpdate("delete", memory);
-            }
-        });
+    private setupProcessMessageHandler(): void {
+        if (process.send) {
+            process.on("message", async (message: any) => {
+                if (message.type === "memory_sync") {
+                    await this.handleMemorySync(message);
+                }
+            });
+        }
     }
 
-    private handleSyncMessage(message: MemorySyncMessage): void {
-        // Skip if message is from this process
-        if (message.processId === process.pid) {
-            return;
-        }
-
-        // Skip if message is older than our last sync
-        if (message.timestamp <= this.lastSyncTimestamp) {
-            return;
-        }
-
+    private async handleMemorySync(message: any): Promise<void> {
         try {
-            switch (message.operation) {
-                case "create":
-                case "update":
-                    this.recentMemories.set(message.memory.id, message.memory);
-                    this.emit("memory_synced", message.memory);
-                    break;
-                case "delete":
-                    this.recentMemories.delete(message.memory.id);
-                    this.emit("memory_deleted", message.memory.id);
-                    break;
+            const { operation, memory, timestamp, processId } = message;
+
+            // Skip if this is our own message
+            if (processId === process.pid) {
+                return;
             }
 
-            this.lastSyncTimestamp = message.timestamp;
+            if (operation === "delete") {
+                // Handle memory deletion
+                this.recentMemories.delete(memory.id);
+                await this.notifyMemoryDeleted(memory.id);
+            } else {
+                // Store in recent memories for both create and update
+                this.recentMemories.set(memory.id, {
+                    ...memory,
+                    syncTimestamp: timestamp
+                });
+
+                // Notify subscribers with appropriate event
+                if (operation === "update") {
+                    await this.notifyMemoryUpdated(memory);
+                } else {
+                    await this.notifyMemorySynced(memory);
+                }
+            }
         } catch (error) {
             elizaLogger.error("Error handling memory sync message:", error);
         }
     }
 
-    private broadcastMemoryUpdate(operation: "create" | "update" | "delete", memory: Memory): void {
-        const message: MemorySyncMessage = {
-            type: "memory_sync",
-            operation,
-            memory,
-            timestamp: Date.now(),
-            processId: process.pid
-        };
-
-        // Store in recent memories
-        if (operation !== "delete") {
-            this.recentMemories.set(memory.id, memory);
-        } else {
-            this.recentMemories.delete(memory.id);
-        }
-
-        // Send to other processes
-        if (process.send) {
-            process.send(message);
-        }
-
-        // Update last sync timestamp
-        this.lastSyncTimestamp = message.timestamp;
-    }
-
     private startCleanupInterval(): void {
         setInterval(() => {
             const now = Date.now();
-            for (const [id, memory] of this.recentMemories) {
-                const createdAt = typeof memory.content.createdAt === 'number' ? memory.content.createdAt : 0;
-                if (now - createdAt > this.RECENT_MEMORY_TTL) {
+            for (const [id, memory] of this.recentMemories.entries()) {
+                if (now - (memory as any).syncTimestamp > this.RECENT_MEMORY_TTL) {
                     this.recentMemories.delete(id);
                 }
             }
-        }, 60000); // Run cleanup every minute
+        }, this.RECENT_MEMORY_TTL);
     }
 
-    public getRecentMemory(id: UUID): Memory | undefined {
+    public getRecentMemory(id: string): Memory | undefined {
         return this.recentMemories.get(id);
     }
 
@@ -136,11 +105,115 @@ export class MemorySyncManager extends EventEmitter {
         return Array.from(this.recentMemories.values());
     }
 
-    public onMemorySynced(callback: (memory: Memory) => void): void {
-        this.on("memory_synced", callback);
+    public onMemorySynced(callback: (memory: Memory) => Promise<void>): void {
+        this.memorySyncCallbacks.add(callback);
     }
 
-    public onMemoryDeleted(callback: (memoryId: UUID) => void): void {
-        this.on("memory_deleted", callback);
+    public onMemoryDeleted(callback: (memoryId: string) => Promise<void>): void {
+        this.memoryDeleteCallbacks.add(callback);
+    }
+
+    private async notifyMemorySynced(memory: Memory): Promise<void> {
+        const errors: Error[] = [];
+        
+        // First emit the event
+        this.emit("memory_synced", memory);
+
+        // Then notify all subscribers
+        for (const callback of this.memorySyncCallbacks) {
+            try {
+                await callback(memory);
+            } catch (error) {
+                errors.push(error as Error);
+                elizaLogger.error("Error in memory sync callback:", error);
+            }
+        }
+
+        if (errors.length > 0) {
+            elizaLogger.error(`${errors.length} errors occurred while notifying memory sync subscribers`);
+        }
+    }
+
+    private async notifyMemoryDeleted(memoryId: string): Promise<void> {
+        const errors: Error[] = [];
+        
+        // First emit the event
+        this.emit("memory_deleted", memoryId);
+
+        // Then notify all subscribers
+        for (const callback of this.memoryDeleteCallbacks) {
+            try {
+                await callback(memoryId);
+            } catch (error) {
+                errors.push(error as Error);
+                elizaLogger.error("Error in memory deletion callback:", error);
+            }
+        }
+
+        if (errors.length > 0) {
+            elizaLogger.error(`${errors.length} errors occurred while notifying memory deletion subscribers`);
+        }
+    }
+
+    private async notifyMemoryUpdated(memory: Memory): Promise<void> {
+        const errors: Error[] = [];
+        
+        // First emit the event
+        this.emit("memory_updated", memory);
+
+        // Then notify all subscribers
+        for (const callback of this.memorySyncCallbacks) {
+            try {
+                await callback(memory);
+            } catch (error) {
+                errors.push(error as Error);
+                elizaLogger.error("Error in memory update callback:", error);
+            }
+        }
+
+        if (errors.length > 0) {
+            elizaLogger.error(`${errors.length} errors occurred while notifying memory update subscribers`);
+        }
+    }
+
+    public removeMemorySyncCallback(callback: (memory: Memory) => Promise<void>): void {
+        this.memorySyncCallbacks.delete(callback);
+    }
+
+    public removeMemoryDeleteCallback(callback: (memoryId: string) => Promise<void>): void {
+        this.memoryDeleteCallbacks.delete(callback);
+    }
+
+    public async syncMemory(message: MemorySyncMessage): Promise<void> {
+        if (!process.send) return;
+
+        try {
+            // Send to other processes
+            process.send(message);
+
+            // Handle locally based on operation
+            const { operation, memory } = message;
+            
+            if (operation === "delete") {
+                this.recentMemories.delete(memory.id);
+                await this.notifyMemoryDeleted(memory.id);
+            } else {
+                // Store in recent memories for both create and update
+                this.recentMemories.set(memory.id, {
+                    ...memory,
+                    syncTimestamp: message.timestamp
+                });
+
+                // Notify subscribers with appropriate event
+                if (operation === "update") {
+                    await this.notifyMemoryUpdated(memory);
+                } else {
+                    await this.notifyMemorySynced(memory);
+                }
+            }
+        } catch (error) {
+            elizaLogger.error("Error syncing memory:", error);
+            throw error;
+        }
     }
 } 

@@ -1,12 +1,15 @@
-import { elizaLogger, IMemoryManager, IDatabaseAdapter, ICacheManager, IAgentRuntime, UUID, IDatabaseCacheAdapter, Service, ServiceType } from "@elizaos/core";
-import { MemoryManager } from "./memory";
+import { elizaLogger, IMemoryManager, IDatabaseAdapter, ICacheManager, IAgentRuntime, UUID, IDatabaseCacheAdapter, Service, ServiceType, CacheOptions } from "@elizaos/core";
+import { MemoryManager } from "./memory/index.ts";
 import { SqliteDatabaseAdapter } from "@elizaos/adapter-sqlite";
 import { PostgresDatabaseAdapter } from "@elizaos/adapter-postgres";
-import { ContentStatus } from "./types/base";
-import { TreasuryTransaction } from "./types/treasury";
-import { MemoryManagerFactory } from "./memory/MemoryManagerFactory";
-import path from 'path';
-import fs from 'fs';
+import { ContentStatus } from "./types/base.ts";
+import { TreasuryTransaction } from "./types/treasury.ts";
+import { MemoryManagerFactory, MemoryConfig } from "./memory/MemoryManagerFactory.ts";
+import * as path from 'path';
+import * as fs from 'fs';
+import pgPkg from 'pg';
+const pg = pgPkg;
+import { Database } from 'better-sqlite3';
 
 export interface SharedDatabaseConfig {
     url: string;
@@ -181,7 +184,22 @@ export const getSharedDatabase = async (runtime: IAgentRuntime): Promise<SharedD
             };
 
             // Initialize cache manager
-            const cache = adapter as unknown as ICacheManager;
+            const cache = {
+                get: async <T>(key: string): Promise<T | null> => {
+                    const result = await (adapter as any).getCache({ key, agentId: runtime.agentId });
+                    return result ? JSON.parse(result) : null;
+                },
+                set: async <T>(key: string, value: T, options?: CacheOptions): Promise<void> => {
+                    await (adapter as any).setCache({
+                        key,
+                        agentId: runtime.agentId,
+                        value: JSON.stringify(value)
+                    });
+                },
+                delete: async (key: string): Promise<void> => {
+                    await (adapter as any).deleteCache({ key, agentId: runtime.agentId });
+                }
+            };
 
             sharedDatabase = {
                 config,
@@ -435,7 +453,7 @@ class PostgresConnection implements DatabaseConnection {
     constructor(private config: SharedDatabaseConfig) {}
 
     async connect(): Promise<void> {
-        const { Pool } = require('pg');
+        const { Pool } = pg;
         this.pool = new Pool({
             connectionString: this.config.url,
             ssl: this.config.ssl,
@@ -477,17 +495,9 @@ const statusMap: Record<string, ContentStatus> = {
     'failed': 'failed'
 } as const;
 
-interface DatabaseConfig {
-    adapter: any;
-    cache: any;
-}
-
-interface MemoryConfig {
-    type: "postgres" | "sqlite";
-    connectionString: string;
-    maxConnections?: number;
-    idleTimeoutMillis?: number;
-    ssl?: boolean;
+export interface DatabaseConfig {
+    adapter: IDatabaseAdapter;
+    cache: ICacheManager;
 }
 
 /**
@@ -515,50 +525,103 @@ function getSharedDbPath(): string {
 /**
  * Initialize database connections for a specific process
  */
-export async function getProcessDatabase(runtime: IAgentRuntime, processName: string): Promise<DatabaseConfig> {
-    const dbType = process.env.DATABASE_TYPE || "sqlite";
-    
-    if (dbType === "postgres") {
-        // For Postgres, use the shared connection string
-        const config = {
-            runtimeManager: runtime.messageManager,
-            database: {
-                type: "postgres" as const,
-                connectionString: process.env.DATABASE_URL || "postgresql://localhost:5432/dao",
-                maxConnections: parseInt(process.env.DATABASE_MAX_CONNECTIONS || "50"),
-                idleTimeoutMillis: parseInt(process.env.DATABASE_IDLE_TIMEOUT || "30000"),
-                ssl: process.env.DATABASE_SSL === "true"
-            }
-        };
+export async function getProcessDatabase(
+    runtime: IAgentRuntime,
+    processId: string
+): Promise<DatabaseConfig> {
+    const databaseType = process.env.DATABASE_TYPE || "sqlite";
+    const databaseUrl = process.env.DATABASE_URL;
 
-        const adapter = await MemoryManagerFactory.getInstance(runtime, config);
-        return {
-            adapter,
-            cache: adapter // Use same adapter for cache in Postgres
-        };
-    } else {
-        // For SQLite, use a single shared database
-        const sharedDbPath = path.join(process.cwd(), 'data', 'shared.db');
-        
-        // Ensure data directory exists
-        const dataDir = path.dirname(sharedDbPath);
-        if (!fs.existsSync(dataDir)) {
-            fs.mkdirSync(dataDir, { recursive: true });
+    elizaLogger.info(`Initializing database with type: ${databaseType}`);
+
+    let adapter: IDatabaseAdapter;
+    let cache: ICacheManager;
+
+    try {
+        if (databaseType === "postgres") {
+            if (!databaseUrl) {
+                throw new Error("DATABASE_URL environment variable is required for PostgreSQL");
+            }
+
+            elizaLogger.info("Initializing PostgreSQL adapter...");
+            const postgresAdapter = new PostgresDatabaseAdapter({
+                connectionString: databaseUrl,
+                max: 20
+            });
+
+            // Add transaction methods
+            const adapterWithTransactions = Object.assign(postgresAdapter, {
+                beginTransaction: async function() {
+                    return this.query('BEGIN');
+                },
+                commitTransaction: async function() {
+                    return this.query('COMMIT');
+                },
+                rollbackTransaction: async function() {
+                    return this.query('ROLLBACK');
+                }
+            });
+
+            adapter = adapterWithTransactions as unknown as IDatabaseAdapter;
+            await adapter.init();
+            elizaLogger.info("PostgreSQL adapter initialized successfully");
+
+            // Create a cache manager that implements ICacheManager
+            cache = {
+                get: async <T>(key: string): Promise<T | null> => {
+                    const result = await (adapter as any).getCache({ key, agentId: runtime.agentId });
+                    return result ? JSON.parse(result) : null;
+                },
+                set: async <T>(key: string, value: T, options?: CacheOptions): Promise<void> => {
+                    await (adapter as any).setCache({
+                        key,
+                        agentId: runtime.agentId,
+                        value: JSON.stringify(value)
+                    });
+                },
+                delete: async (key: string): Promise<void> => {
+                    await (adapter as any).deleteCache({ key, agentId: runtime.agentId });
+                }
+            };
+
+        } else {
+            elizaLogger.info("Initializing SQLite adapter...");
+            const sqlite3 = require('better-sqlite3');
+            const sqliteDb = new sqlite3(":memory:", {
+                verbose: process.env.NODE_ENV === 'development' ? console.log : undefined
+            });
+            
+            const sqliteAdapter = new SqliteDatabaseAdapter(sqliteDb);
+            adapter = sqliteAdapter as unknown as IDatabaseAdapter;
+            await adapter.init();
+            elizaLogger.info("SQLite adapter initialized successfully");
+
+            // Create in-memory cache for SQLite
+            const memoryCache = new Map<string, any>();
+            cache = {
+                get: async <T>(key: string): Promise<T | null> => memoryCache.get(key) || null,
+                set: async <T>(key: string, value: T, options?: CacheOptions): Promise<void> => {
+                    memoryCache.set(key, value);
+                },
+                delete: async (key: string): Promise<void> => {
+                    memoryCache.delete(key);
+                }
+            };
         }
 
-        const config = {
-            runtimeManager: runtime.messageManager,
-            database: {
-                type: "sqlite" as const,
-                connectionString: `sqlite://${sharedDbPath}`
-            }
-        };
+        elizaLogger.info("Cache manager initialized successfully");
 
-        const adapter = await MemoryManagerFactory.getInstance(runtime, config);
         return {
             adapter,
-            cache: adapter // Use same adapter for both operations
+            cache,
         };
+    } catch (error) {
+        elizaLogger.error("Failed to initialize database:", {
+            type: databaseType,
+            error: error instanceof Error ? error.message : error,
+            stack: error instanceof Error ? error.stack : undefined
+        });
+        throw error;
     }
 }
 

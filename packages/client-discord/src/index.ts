@@ -39,7 +39,10 @@ export class DiscordClient extends EventEmitter {
     constructor(runtime: IAgentRuntime) {
         super();
 
-        this.apiToken = runtime.getSetting("DISCORD_API_TOKEN") as string;
+        this.apiToken = runtime.discordToken || runtime.getSetting("DISCORD_API_TOKEN") as string;
+        if (!this.apiToken) {
+            throw new Error("No Discord API token provided. Set either discordToken in runtime or DISCORD_API_TOKEN in settings.");
+        }
         this.client = new Client({
             intents: [
                 GatewayIntentBits.Guilds,

@@ -1,6 +1,6 @@
 import { MongoClient } from 'mongodb';
 import {
-    DatabaseAdapter,
+    IDatabaseAdapter,
     RAGKnowledgeItem,
     IDatabaseCacheAdapter,
     Account,
@@ -10,7 +10,8 @@ import {
     type Goal,
     type Memory,
     type Relationship,
-    type UUID, elizaLogger,
+    type UUID,
+    elizaLogger,
 } from "@elizaos/core";
 import { v4 } from "uuid";
 
@@ -35,19 +36,16 @@ interface KnowledgeDocument {
     isShared: boolean;
 }
 
-export class MongoDBDatabaseAdapter
-    extends DatabaseAdapter<MongoClient>
-    implements IDatabaseCacheAdapter
-{
+export class MongoDBDatabaseAdapter implements IDatabaseAdapter {
     private database: any;
     private databaseName: string;
     private hasVectorSearch: boolean;
     private isConnected: boolean = false;
     private isVectorSearchIndexComputable: boolean;
     public db: MongoClient;
+    private currentSession: any = null;
 
     constructor(client: MongoClient, databaseName: string) {
-        super();
         this.db = client;
         this.databaseName = databaseName;
         this.hasVectorSearch = false;
@@ -393,7 +391,6 @@ export class MongoDBDatabaseAdapter
     }
 
     async createMemory(memory: Memory, tableName: string): Promise<void> {
-
         await this.ensureConnection();
         try {
             let isUnique = true;
@@ -422,7 +419,6 @@ export class MongoDBDatabaseAdapter
                 // );
                 isUnique = similarMemories.length === 0;
             }
-
 
             const content = JSON.stringify(memory.content);
             const createdAt = memory.createdAt ?? Date.now();
@@ -541,8 +537,6 @@ export class MongoDBDatabaseAdapter
             limit: params.match_count
         });
     }
-
-
 
     async searchMemoriesByEmbedding(
         embedding: number[],
@@ -1441,5 +1435,106 @@ export class MongoDBDatabaseAdapter
         }
     }
 
+    async beginTransaction(): Promise<void> {
+        await this.ensureConnection();
+        if (this.currentSession) {
+            throw new Error("Transaction already in progress");
+        }
+        this.currentSession = this.db.startSession();
+        await this.currentSession.startTransaction();
+    }
+
+    async commitTransaction(): Promise<void> {
+        if (!this.currentSession) {
+            throw new Error("No transaction in progress");
+        }
+        await this.currentSession.commitTransaction();
+        await this.currentSession.endSession();
+        this.currentSession = null;
+    }
+
+    async rollbackTransaction(): Promise<void> {
+        if (!this.currentSession) {
+            throw new Error("No transaction in progress");
+        }
+        await this.currentSession.abortTransaction();
+        await this.currentSession.endSession();
+        this.currentSession = null;
+    }
+
+    async getMemoriesWithPagination(params: {
+        roomId: UUID;
+        limit?: number;
+        cursor?: UUID;
+        startTime?: number;
+        endTime?: number;
+        tableName: string;
+        agentId: UUID;
+    }): Promise<{
+        items: Memory[];
+        hasMore: boolean;
+        nextCursor?: UUID;
+    }> {
+        await this.ensureConnection();
+        const collection = this.database.collection(params.tableName);
+        const limit = params.limit || 50;
+
+        // Build query
+        const query: any = {
+            roomId: params.roomId,
+            agentId: params.agentId
+        };
+
+        // Add time range if specified
+        if (params.startTime || params.endTime) {
+            query.createdAt = {};
+            if (params.startTime) {
+                query.createdAt.$gte = new Date(params.startTime);
+            }
+            if (params.endTime) {
+                query.createdAt.$lte = new Date(params.endTime);
+            }
+        }
+
+        // Add cursor-based pagination
+        if (params.cursor) {
+            query._id = { $gt: params.cursor };
+        }
+
+        // Execute query with limit + 1 to determine if there are more items
+        const memories = await collection
+            .find(query)
+            .sort({ _id: 1 })
+            .limit(limit + 1)
+            .toArray() as Memory[];
+
+        const hasMore = memories.length > limit;
+        const items = memories.slice(0, limit);
+        const nextCursor = hasMore ? items[items.length - 1].id : undefined;
+
+        return {
+            items,
+            hasMore,
+            nextCursor
+        };
+    }
+
+    async query<T>(sql: string, params?: any[]): Promise<{ rows: any[] }> {
+        throw new Error("Raw SQL queries are not supported in the MongoDB adapter");
+    }
+
+    async updateMemory(memory: Memory, tableName: string): Promise<void> {
+        await this.ensureConnection();
+        await this.database.collection(tableName).updateOne(
+            { id: memory.id },
+            { 
+                $set: {
+                    content: JSON.stringify(memory.content),
+                    embedding: memory.embedding ? Array.from(memory.embedding) : null,
+                    updatedAt: new Date()
+                }
+            }
+        );
+    }
 }
 

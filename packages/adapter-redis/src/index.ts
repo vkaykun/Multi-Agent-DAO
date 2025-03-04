@@ -1,7 +1,13 @@
 import Redis from "ioredis";
-import { type IDatabaseCacheAdapter, type UUID, elizaLogger } from "@elizaos/core";
+import { type UUID, elizaLogger } from "@elizaos/core";
 
-export class RedisClient implements IDatabaseCacheAdapter {
+interface ICacheAdapter {
+    getCache(params: { agentId: UUID; key: string }): Promise<string | undefined>;
+    setCache(params: { agentId: UUID; key: string; value: string }): Promise<boolean>;
+    deleteCache(params: { agentId: UUID; key: string }): Promise<boolean>;
+}
+
+export class RedisClient implements ICacheAdapter {
     private client: Redis;
 
     constructor(redisUrl: string) {

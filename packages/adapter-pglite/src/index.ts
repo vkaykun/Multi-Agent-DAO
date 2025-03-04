@@ -8,11 +8,10 @@ import {
     type Memory,
     type Relationship,
     type UUID,
-    type IDatabaseCacheAdapter,
+    type IDatabaseAdapter,
     type Participant,
     elizaLogger,
     getEmbeddingConfig,
-    DatabaseAdapter,
     EmbeddingProvider,
     type RAGKnowledgeItem,
 } from "@elizaos/core";
@@ -31,12 +30,56 @@ import { fuzzystrmatch } from "@electric-sql/pglite/contrib/fuzzystrmatch";
 const __filename = fileURLToPath(import.meta.url); // get the resolved path to the file
 const __dirname = path.dirname(__filename); // get the name of the directory
 
-export class PGLiteDatabaseAdapter
-    extends DatabaseAdapter<PGlite>
-    implements IDatabaseCacheAdapter
-{
+// Add CircuitBreaker class at the top
+class CircuitBreaker {
+    private state: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
+    private failureCount = 0;
+    private lastFailureTime = 0;
+
+    constructor(private config: {
+        failureThreshold: number;
+        resetTimeout: number;
+        halfOpenMaxAttempts: number;
+    }) {}
+
+    async execute<T>(operation: () => Promise<T>): Promise<T> {
+        if (this.state === 'OPEN') {
+            if (Date.now() - this.lastFailureTime >= this.config.resetTimeout) {
+                this.state = 'HALF_OPEN';
+            } else {
+                throw new Error('Circuit breaker is OPEN');
+            }
+        }
+
+        try {
+            const result = await operation();
+            if (this.state === 'HALF_OPEN') {
+                this.state = 'CLOSED';
+                this.failureCount = 0;
+            }
+            return result;
+        } catch (error) {
+            this.failureCount++;
+            this.lastFailureTime = Date.now();
+            
+            if (this.failureCount >= this.config.failureThreshold) {
+                this.state = 'OPEN';
+            }
+            throw error;
+        }
+    }
+
+    getState(): string {
+        return this.state;
+    }
+}
+
+export class PGLiteDatabaseAdapter implements IDatabaseAdapter {
+    db: PGlite;
+    private currentTransaction: Transaction | null = null;
+    private circuitBreaker: CircuitBreaker;
+
     constructor(options: PGliteOptions) {
-        super();
         this.db = new PGlite({
             ...options,
             // Add the vector and fuzzystrmatch extensions
@@ -46,6 +89,23 @@ export class PGLiteDatabaseAdapter
                 fuzzystrmatch,
             },
         });
+        this.circuitBreaker = new CircuitBreaker({
+            failureThreshold: 5,
+            resetTimeout: 60000,
+            halfOpenMaxAttempts: 3
+        });
+    }
+
+    protected async withCircuitBreaker<T>(
+        operation: () => Promise<T>,
+        context: string
+    ): Promise<T> {
+        try {
+            return await this.circuitBreaker.execute(operation);
+        } catch (error) {
+            elizaLogger.error(`Circuit breaker error in ${context}:`, error);
+            throw error;
+        }
     }
 
     async init() {
@@ -1557,6 +1617,111 @@ export class PGLiteDatabaseAdapter
                 });
             }
         }, "clearKnowledge");
+    }
+
+    async beginTransaction(): Promise<void> {
+        if (this.currentTransaction) {
+            throw new Error("Transaction already in progress");
+        }
+        await this.withTransaction(async (tx) => {
+            this.currentTransaction = tx;
+        }, "beginTransaction");
+    }
+
+    async commitTransaction(): Promise<void> {
+        if (!this.currentTransaction) {
+            throw new Error("No transaction in progress");
+        }
+        this.currentTransaction = null;
+    }
+
+    async rollbackTransaction(): Promise<void> {
+        if (!this.currentTransaction) {
+            throw new Error("No transaction in progress");
+        }
+        this.currentTransaction = null;
+    }
+
+    async getMemoriesWithPagination(params: {
+        roomId: UUID;
+        limit?: number;
+        cursor?: UUID;
+        startTime?: number;
+        endTime?: number;
+        tableName: string;
+        agentId: UUID;
+    }): Promise<{
+        items: Memory[];
+        hasMore: boolean;
+        nextCursor?: UUID;
+    }> {
+        return this.withDatabase(async () => {
+            let query = `SELECT * FROM memories WHERE type = $1 AND "roomId" = $2 AND "agentId" = $3`;
+            const queryParams: any[] = [params.tableName, params.roomId, params.agentId];
+            let paramCount = 3;
+
+            if (params.cursor) {
+                const cursorMemory = await this.query<Memory>(
+                    'SELECT "createdAt" FROM memories WHERE id = $1',
+                    [params.cursor]
+                );
+                if (cursorMemory.rows.length > 0) {
+                    paramCount++;
+                    query += ` AND "createdAt" < $${paramCount}`;
+                    queryParams.push(cursorMemory.rows[0].createdAt);
+                }
+            }
+
+            if (params.startTime) {
+                paramCount++;
+                query += ` AND "createdAt" >= $${paramCount}`;
+                queryParams.push(new Date(params.startTime));
+            }
+
+            if (params.endTime) {
+                paramCount++;
+                query += ` AND "createdAt" <= $${paramCount}`;
+                queryParams.push(new Date(params.endTime));
+            }
+
+            // Order by creation time descending and get one extra record to determine if there are more results
+            const limit = params.limit || 10; // Default to 10 if not specified
+            query += ` ORDER BY "createdAt" DESC LIMIT $${paramCount + 1}`;
+            queryParams.push(limit + 1);
+
+            const { rows } = await this.query<Memory>(query, queryParams);
+
+            const hasMore = rows.length > limit;
+            const items = hasMore ? rows.slice(0, -1) : rows;
+            const nextCursor = hasMore ? items[items.length - 1].id : undefined;
+
+            return {
+                items: items.map(memory => ({
+                    ...memory,
+                    content: typeof memory.content === "string" ? JSON.parse(memory.content) : memory.content
+                })),
+                hasMore,
+                nextCursor
+            };
+        }, "getMemoriesWithPagination");
+    }
+
+    async updateMemory(memory: Memory, tableName: string): Promise<void> {
+        return this.withDatabase(async () => {
+            await this.db.query(
+                `UPDATE memories 
+                SET content = $1, 
+                    embedding = $2,
+                    "updatedAt" = CURRENT_TIMESTAMP 
+                WHERE id = $3 AND type = $4`,
+                [
+                    JSON.stringify(memory.content),
+                    memory.embedding ? `[${memory.embedding.join(",")}]` : null,
+                    memory.id,
+                    tableName
+                ]
+            );
+        }, "updateMemory");
     }
 }
 

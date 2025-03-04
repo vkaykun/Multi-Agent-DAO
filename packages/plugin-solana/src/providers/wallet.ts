@@ -6,9 +6,9 @@ import {
     elizaLogger,
 } from "@elizaos/core";
 import { Connection, PublicKey } from "@solana/web3.js";
-import { toBN, BigNumber } from "../utils/bignumber.js";
+import { toBN, BigNumber } from "../utils/bignumber.ts";
 import NodeCache from "node-cache";
-import { getWalletKey } from "../keypairUtils.js";
+import { getWalletKey } from "../keypairUtils.ts";
 
 // Provider configuration
 const PROVIDER_CONFIG = {
@@ -66,6 +66,14 @@ export class WalletProvider {
         private walletPublicKey: PublicKey
     ) {
         this.cache = new NodeCache({ stdTTL: 300 }); // Cache TTL set to 5 minutes
+    }
+
+    /**
+     * Get the wallet address as a string
+     * @returns The wallet public key as a base58 encoded string
+     */
+    public getWalletAddress(): string {
+        return this.walletPublicKey.toBase58();
     }
 
     private async fetchWithRetry(

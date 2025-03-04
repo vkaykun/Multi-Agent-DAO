@@ -22,7 +22,6 @@
         "@discordjs/voice": "0.17.0",
         "@elizaos/core": "workspace:*",
         "@elizaos/plugin-node": "workspace:*",
-        "@elizaos/plugin-solana": "workspace:*",
         "discord.js": "14.16.3",
         "libsodium-wrappers": "0.7.15",
         "prism-media": "1.3.5"

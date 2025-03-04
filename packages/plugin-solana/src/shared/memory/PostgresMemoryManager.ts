@@ -1,8 +1,12 @@
+// packages/plugin-solana/src/shared/memory/PostgresMemoryManager.ts
+
 import { IAgentRuntime, Memory, UUID, elizaLogger } from "@elizaos/core";
-import { BaseMemoryManager } from "./BaseMemoryManager";
-import { MemoryQueryOptions } from "../types/memory";
+import { BaseMemoryManager, VersionHistory } from "./BaseMemoryManager.ts";
+import { MemoryQueryOptions } from "../types/memory.ts";
 import { PostgresDatabaseAdapter } from "@elizaos/adapter-postgres";
-import { BaseContent, isUniqueMemoryType, isVersionedMemoryType, UNIQUE_MEMORY_TYPES } from "../types/base";
+import { BaseContent, isUniqueMemoryType, isVersionedMemoryType, UNIQUE_MEMORY_TYPES } from "../types/base.ts";
+import { CONVERSATION_ROOM_ID } from "../utils/messageUtils.js";
+import { v4 } from "uuid";
 
 /**
  * PostgreSQL implementation of the memory manager.
@@ -14,6 +18,8 @@ export class PostgresMemoryManager extends BaseMemoryManager {
     private writeQueue: Promise<void> = Promise.resolve();
     private writeQueueLock = false;
     protected _isInTransaction = false;
+    protected transactionLevel = 0;
+    protected savepointCounter = 0;
 
     constructor(
         runtime: IAgentRuntime,
@@ -43,34 +49,164 @@ export class PostgresMemoryManager extends BaseMemoryManager {
         return this._isInTransaction;
     }
 
+    get currentTransactionLevel(): number {
+        return this.transactionLevel;
+    }
+
     async initialize(): Promise<void> {
         await this.adapter.init();
+        
+        // Create memories table with all required columns and constraints
+        await this.adapter.query(`
+            CREATE TABLE IF NOT EXISTS ${this.tableName} (
+                id UUID PRIMARY KEY,
+                content JSONB NOT NULL,
+                room_id UUID NOT NULL,
+                user_id UUID NOT NULL,
+                agent_id UUID NOT NULL,
+                unique BOOLEAN DEFAULT false,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                embedding FLOAT[]
+            );
+
+            -- Index for room-based queries (heavily used in getMemories)
+            CREATE INDEX IF NOT EXISTS idx_memories_room_id 
+            ON ${this.tableName}(room_id);
+
+            -- Index for content type lookups (used in memory subscriptions)
+            CREATE INDEX IF NOT EXISTS idx_memories_content_type 
+            ON ${this.tableName}((content->>'type'));
+
+            -- Index for timestamp-based queries
+            CREATE INDEX IF NOT EXISTS idx_memories_created_at 
+            ON ${this.tableName}(created_at DESC);
+
+            -- Partial unique index for distributed locks
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_active_distributed_locks 
+            ON ${this.tableName} ((content->>'key'))
+            WHERE content->>'type' = 'distributed_lock' 
+            AND content->>'lockState' = 'active';
+
+            -- Composite index for room + type queries
+            CREATE INDEX IF NOT EXISTS idx_memories_room_type 
+            ON ${this.tableName}(room_id, (content->>'type'));
+
+            -- Index for user-specific queries
+            CREATE INDEX IF NOT EXISTS idx_memories_user_id 
+            ON ${this.tableName}(user_id);
+
+            -- Index for agent-specific queries
+            CREATE INDEX IF NOT EXISTS idx_memories_agent_id 
+            ON ${this.tableName}(agent_id);
+        `);
+
+        // Create versions table for versioned memory types
+        await this.adapter.query(`
+            CREATE TABLE IF NOT EXISTS ${this.tableName}_versions (
+                id UUID NOT NULL,
+                version INTEGER NOT NULL,
+                content JSONB NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                version_reason TEXT,
+                PRIMARY KEY (id, version),
+                FOREIGN KEY (id) REFERENCES ${this.tableName}(id) ON DELETE CASCADE
+            );
+
+            -- Index for version history queries
+            CREATE INDEX IF NOT EXISTS idx_memory_versions_id_version 
+            ON ${this.tableName}_versions(id, version DESC);
+        `);
+
+        // Add triggers for automatic timestamp updates
+        await this.adapter.query(`
+            CREATE OR REPLACE FUNCTION update_updated_at()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.updated_at = CURRENT_TIMESTAMP;
+                RETURN NEW;
+            END;
+            $$ language 'plpgsql';
+
+            DROP TRIGGER IF EXISTS update_memories_updated_at 
+            ON ${this.tableName};
+
+            CREATE TRIGGER update_memories_updated_at
+            BEFORE UPDATE ON ${this.tableName}
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at();
+        `);
+
+        // Add row-level security if enabled
+        if (process.env.ENABLE_RLS === 'true') {
+            await this.adapter.query(`
+                ALTER TABLE ${this.tableName} ENABLE ROW LEVEL SECURITY;
+                
+                -- Policy: Agents can only access memories in their rooms
+                CREATE POLICY agent_room_access ON ${this.tableName}
+                FOR ALL
+                TO authenticated
+                USING (
+                    room_id = current_setting('app.current_room_id')::uuid
+                    OR agent_id = current_setting('app.current_agent_id')::uuid
+                );
+            `);
+        }
+
+        elizaLogger.info(`Initialized PostgresMemoryManager tables and indexes`);
     }
 
     protected async beginTransactionInternal(): Promise<void> {
-        if (this._isInTransaction) {
-            throw new Error('Transaction already in progress');
+        if (this.transactionLevel === 0) {
+            // Start a new top-level transaction
+            this.currentTransaction = await this.adapter.query('BEGIN');
+            this._isInTransaction = true;
+        } else {
+            // Create a savepoint for nested transaction
+            const savepointName = `sp_${++this.savepointCounter}`;
+            await this.adapter.query(`SAVEPOINT ${savepointName}`);
         }
-        this.currentTransaction = await this.adapter.query('BEGIN');
-        this._isInTransaction = true;
+        this.transactionLevel++;
     }
 
     protected async commitTransactionInternal(): Promise<void> {
-        if (!this._isInTransaction) {
+        if (this.transactionLevel === 0) {
             throw new Error('No transaction in progress');
         }
-        await this.adapter.query('COMMIT');
-        this.currentTransaction = null;
-        this._isInTransaction = false;
+
+        this.transactionLevel--;
+
+        if (this.transactionLevel === 0) {
+            // Commit the top-level transaction
+            await this.adapter.query('COMMIT');
+            this.currentTransaction = null;
+            this._isInTransaction = false;
+            this.savepointCounter = 0;
+        } else {
+            // Release the savepoint
+            const savepointName = `sp_${this.savepointCounter--}`;
+            await this.adapter.query(`RELEASE SAVEPOINT ${savepointName}`);
+        }
     }
 
     protected async rollbackTransactionInternal(): Promise<void> {
-        if (!this._isInTransaction) {
+        if (this.transactionLevel === 0) {
             throw new Error('No transaction in progress');
         }
-        await this.adapter.query('ROLLBACK');
-        this.currentTransaction = null;
-        this._isInTransaction = false;
+
+        if (this.transactionLevel === 1) {
+            // Rollback the entire transaction
+            await this.adapter.query('ROLLBACK');
+            this.currentTransaction = null;
+            this._isInTransaction = false;
+            this.savepointCounter = 0;
+        } else {
+            // Rollback to the last savepoint
+            const savepointName = `sp_${this.savepointCounter--}`;
+            await this.adapter.query(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+        }
+        this.transactionLevel--;
     }
 
     private async enqueueWrite<T>(operation: () => Promise<T>): Promise<T> {
@@ -95,76 +231,68 @@ export class PostgresMemoryManager extends BaseMemoryManager {
         }
     }
 
-    protected async createMemoryInternal(memory: Memory, unique?: boolean): Promise<void> {
-        return this.enqueueWrite(async () => {
-            try {
-                const content = memory.content as BaseContent;
-                const isUniqueType = isUniqueMemoryType(content.type);
-                
-                // Handle versioning if needed
-                if (isVersionedMemoryType(content.type)) {
-                    const version = content.metadata?.version || 1;
-                    const versionReason = content.metadata?.versionReason || 'Initial version';
+    protected async createMemoryInternal(memory: Memory): Promise<void> {
+        try {
+            // Use memory.type if it exists, otherwise fall back to content.type
+            const typeField = memory.type || memory.content?.type;
+            
+            elizaLogger.debug(`Creating memory with type: ${typeField}`, {
+                explicitType: memory.type,
+                contentType: memory.content?.type,
+                finalType: typeField
+            });
 
-                    // First store in versions table
-                    await this.adapter.query(
-                        `INSERT INTO ${this.tableName}_versions 
-                        (id, version, content, room_id, user_id, agent_id, created_at, updated_at, version_reason)
-                        VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0), to_timestamp($8/1000.0), $9)`,
-                        [
-                            memory.id,
-                            version,
-                            JSON.stringify(content),
-                            memory.roomId,
-                            memory.userId,
-                            memory.agentId,
-                            memory.content.createdAt || Date.now(),
-                            memory.content.updatedAt || Date.now(),
-                            versionReason
-                        ]
-                    );
-                }
-
-                // For non-versioned types, use appropriate insert strategy
-                // If it's a unique type and unique flag is true, use DO NOTHING
-                // If it's a unique type and unique flag is false, use DO UPDATE
-                // If it's not a unique type, always use DO UPDATE
-                const insertType = isUniqueType && memory.unique ? 
-                    'ON CONFLICT DO NOTHING' : 
-                    'ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, updated_at = EXCLUDED.updated_at';
-                
-                await this.adapter.query(
-                    `INSERT INTO ${this.tableName} 
-                    (id, content, room_id, user_id, agent_id, unique, created_at, updated_at, embedding)
-                    VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0), to_timestamp($8/1000.0), $9)
-                    ${insertType}`,
-                    [
-                        memory.id,
-                        JSON.stringify(content),
-                        memory.roomId,
-                        memory.userId,
-                        memory.agentId,
-                        memory.unique,
-                        memory.content.createdAt || Date.now(),
-                        memory.content.updatedAt || Date.now(),
-                        memory.embedding ? `[${memory.embedding.join(",")}]` : null
-                    ]
-                );
-
-                elizaLogger.debug(`Created memory ${memory.id}`, {
-                    type: content.type,
-                    roomId: memory.roomId,
-                    unique: memory.unique,
-                    versioned: isVersionedMemoryType(content.type)
-                });
-            } catch (error) {
-                elizaLogger.error(`Error creating memory:`, error);
-                if (this.currentTransaction) {
-                    await this.rollbackTransaction();
-                }
-                throw error;
+            // Ensure we have a valid type
+            if (!typeField) {
+                throw new Error('Memory must have either memory.type or memory.content.type set');
             }
-        });
+
+            // Insert the memory with the type field
+            const query = `
+                INSERT INTO ${this.tableName} (
+                    id, 
+                    type,
+                    content, 
+                    room_id, 
+                    user_id, 
+                    agent_id, 
+                    unique, 
+                    created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            `;
+
+            await this.adapter.query(query, [
+                memory.id || v4(),
+                typeField,
+                memory.content,
+                memory.roomId,
+                memory.userId,
+                memory.agentId,
+                memory.unique ?? true,
+                memory.createdAt ? new Date(memory.createdAt) : new Date()
+            ]);
+
+            if (memory.content?.type === "wallet_registration" || 
+                memory.content?.type === "pending_wallet_registration") {
+                elizaLogger.info("WALLET REGISTRATION MEMORY CREATED", {
+                    operation: "createMemory",
+                    memoryType: typeField,
+                    memoryId: memory.id,
+                    roomId: memory.roomId,
+                    userId: memory.userId,
+                    walletAddress: memory.content.walletAddress,
+                    status: memory.content.status,
+                    isTreasuryOperation: true
+                });
+            }
+
+        } catch (error) {
+            elizaLogger.error('Error creating memory:', error);
+            if (this.currentTransaction) {
+                await this.rollbackTransaction();
+            }
+            throw error;
+        }
     }
 
     private async checkDuplicate(memory: Memory): Promise<boolean> {
@@ -196,60 +324,6 @@ export class PostgresMemoryManager extends BaseMemoryManager {
         } catch (error) {
             elizaLogger.error(`Error checking for duplicate memory:`, error);
             return false;
-        }
-    }
-
-    protected async checkUniqueness(memory: Memory): Promise<boolean> {
-        const content = memory.content as BaseContent;
-        
-        if (!isUniqueMemoryType(content.type)) {
-            return false;
-        }
-
-        const uniqueConstraints = UNIQUE_MEMORY_TYPES[content.type].uniqueBy;
-        
-        // Build query dynamically based on constraints
-        const conditions = uniqueConstraints.map((constraint, index) => {
-            const [field, subfield] = constraint.split('.');
-            if (subfield) {
-                // Handle nested fields (e.g., metadata.proposalId)
-                return `content->'${field}'->>'${subfield}' = $${index + 2}`;
-            }
-            return `content->>'${field}' = $${index + 2}`;
-        });
-
-        const query = `
-            SELECT COUNT(*) 
-            FROM ${this.tableName} 
-            WHERE content->>'type' = $1 
-            AND ${conditions.join(' AND ')}
-        `;
-
-        // Build params array
-        const params = [content.type];
-        uniqueConstraints.forEach(constraint => {
-            const [field, subfield] = constraint.split('.');
-            const value = subfield ? 
-                (content[field] as any)?.[subfield] : 
-                content[field];
-            params.push(value);
-        });
-
-        try {
-            const result = await this.adapter.query(query, params);
-            
-            if (result.rows[0].count > 0) {
-                elizaLogger.debug(`Found existing ${content.type} memory with constraints:`, {
-                    type: content.type,
-                    constraints: uniqueConstraints,
-                    values: params.slice(1)
-                });
-            }
-            
-            return result.rows[0].count > 0;
-        } catch (error) {
-            elizaLogger.error(`Error checking uniqueness for memory type ${content.type}:`, error);
-            throw error;
         }
     }
 
@@ -345,6 +419,169 @@ export class PostgresMemoryManager extends BaseMemoryManager {
             ...rest,
             roomId: domain as UUID,
             tableName: this.tableName
+        });
+    }
+
+    /**
+     * Get memories with enhanced filtering capabilities
+     * This method provides support for complex filters like MongoDB-style queries
+     */
+    async getMemoriesWithFilters(options: {
+        roomId: UUID;
+        filter?: Record<string, any>;
+        count?: number;
+        sortBy?: string;
+        sortDirection?: 'asc' | 'desc';
+        unique?: boolean;
+        _treasuryOperation?: boolean;
+    }): Promise<Memory[]> {
+        elizaLogger.debug("PostgresMemoryManager.getMemoriesWithFilters called", {
+            filter: JSON.stringify(options.filter || {}),
+            roomId: options.roomId
+        });
+        
+        // Check if it's a wallet registration query - look for wallet_registration in filter
+        const isWalletRegistrationQuery = options.filter && (
+            // Check for content.type being wallet_registration
+            (options.filter["content.type"] && 
+             (options.filter["content.type"] === "wallet_registration" ||
+              options.filter["content.type"] === "pending_wallet_registration")) ||
+            // Or check for _treasuryOperation flag
+            options._treasuryOperation === true || 
+            options.filter?._treasuryOperation === true
+        );
+        
+        // For treasury operations, ensure we never reject the special conversation ID
+        if (isWalletRegistrationQuery) {
+            // If it's a wallet registration and roomId is the special conversation ID or missing, 
+            // use the special conversation room ID to ensure wallet lookups work properly
+            if (!options.roomId || options.roomId === CONVERSATION_ROOM_ID) {
+                elizaLogger.info("Using conversation room ID for wallet registration query in PostgresMemoryManager", {
+                    filter: JSON.stringify(options.filter),
+                    roomId: CONVERSATION_ROOM_ID
+                });
+                options.roomId = CONVERSATION_ROOM_ID;
+            }
+        }
+        // Handle non-treasury operations with regular roomId validation
+        else if (!options.roomId) {
+            if (process.env.DISABLE_EMBEDDINGS === 'true') {
+                elizaLogger.warn("Missing roomId in PostgresMemoryManager.getMemoriesWithFilters with embeddings disabled, returning empty array");
+                return [];
+            }
+            // For non-treasury operations with missing roomId and embeddings enabled, we'll let the try/catch handle it
+        }
+        
+        try {
+            // Get base memories from the database
+            const memories = await this.getMemoriesInternal({
+                domain: options.roomId,
+                count: options.count || 50, // Higher default to ensure all matches
+                unique: options.unique
+            });
+            
+            // If no filter, just return memories
+            if (!options.filter) {
+                return memories;
+            }
+            
+            // Apply filtering
+            const filteredMemories = this.filterMemoriesComplex(memories, options.filter);
+            
+            // Apply sorting if needed
+            let results = filteredMemories;
+            if (options.sortBy) {
+                results = this.sortMemories(results, options.sortBy, options.sortDirection || 'desc');
+            }
+            
+            // Apply count limit if specified
+            if (options.count && results.length > options.count) {
+                results = results.slice(0, options.count);
+            }
+            
+            elizaLogger.debug(`PostgresMemoryManager.getMemoriesWithFilters returning ${results.length} results`, {
+                firstResultType: results.length > 0 ? results[0]?.content?.type : 'none'
+            });
+            
+            return results;
+        } catch (error) {
+            elizaLogger.error("Error in getMemoriesWithFilters", {
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack : undefined
+            });
+            return [];
+        }
+    }
+    
+    /**
+     * Enhanced filtering that supports MongoDB-style operators
+     */
+    private filterMemoriesComplex(memories: Memory[], filter: Record<string, any>): Memory[] {
+        return memories.filter(memory => {
+            return Object.entries(filter).every(([key, value]) => {
+                // Get the actual value from the memory using dot notation
+                const actualValue = this.getNestedProperty(memory, key);
+                
+                // Handle different filter types
+                if (value === null) {
+                    return actualValue === null;
+                }
+                
+                // Handle MongoDB-style operators
+                if (typeof value === 'object' && value !== null) {
+                    // $eq operator
+                    if (value.$eq !== undefined) {
+                        return actualValue === value.$eq;
+                    }
+                    
+                    // $in operator
+                    if (value.$in !== undefined && Array.isArray(value.$in)) {
+                        return value.$in.includes(actualValue);
+                    }
+                    
+                    // Handle nested object comparison
+                    if (!Array.isArray(value) && !('$eq' in value) && !('$in' in value)) {
+                        return JSON.stringify(actualValue) === JSON.stringify(value);
+                    }
+                }
+                
+                // Simple equality for primitive values
+                return actualValue === value;
+            });
+        });
+    }
+    
+    /**
+     * Helper to get nested property using dot notation
+     */
+    private getNestedProperty(obj: any, path: string): any {
+        return path.split('.').reduce((prev, curr) => 
+            prev && prev[curr] !== undefined ? prev[curr] : undefined, obj);
+    }
+    
+    /**
+     * Sort memories by a property (using dot notation if needed)
+     */
+    private sortMemories(memories: Memory[], sortBy: string, sortDirection: string = 'desc'): Memory[] {
+        return [...memories].sort((a, b) => {
+            const aValue = this.getNestedProperty(a, sortBy);
+            const bValue = this.getNestedProperty(b, sortBy);
+            
+            if (aValue === undefined && bValue === undefined) return 0;
+            if (aValue === undefined) return sortDirection === 'desc' ? 1 : -1;
+            if (bValue === undefined) return sortDirection === 'desc' ? -1 : 1;
+            
+            // Compare dates if they look like timestamps
+            if (typeof aValue === 'number' && typeof bValue === 'number') {
+                return sortDirection === 'desc' ? bValue - aValue : aValue - bValue;
+            }
+            
+            // String comparison
+            const aStr = String(aValue);
+            const bStr = String(bValue);
+            return sortDirection === 'desc' ? 
+                bStr.localeCompare(aStr) : 
+                aStr.localeCompare(bStr);
         });
     }
 
@@ -470,25 +707,57 @@ export class PostgresMemoryManager extends BaseMemoryManager {
         return memories.filter(predicate);
     }
 
-    async getMemoryVersions(id: UUID): Promise<Memory[]> {
-        const result = await this.adapter.query(
-            `SELECT * FROM ${this.tableName}_versions 
-             WHERE id = $1 
-             ORDER BY version DESC`,
-            [id]
-        );
-
-        return result.rows.map(row => this.mapRowToMemory(row));
+    protected async storeVersionHistory(version: VersionHistory): Promise<void> {
+        const query = `
+            INSERT INTO ${this.tableName}_versions (
+                id, version, content, created_at
+            ) VALUES ($1, $2, $3, $4)
+        `;
+        
+        await this.adapter.query(query, [
+            version.id,
+            version.version,
+            JSON.stringify(version.content),
+            version.createdAt
+        ]);
     }
 
-    async getMemoryVersion(id: UUID, version: number): Promise<Memory | null> {
-        const result = await this.adapter.query(
-            `SELECT * FROM ${this.tableName}_versions 
-             WHERE id = $1 AND version = $2`,
-            [id, version]
-        );
+    public async getMemoryVersions(id: UUID): Promise<Memory[]> {
+        const query = `
+            SELECT id, version, content, created_at
+            FROM ${this.tableName}_versions
+            WHERE id = $1
+            ORDER BY version DESC
+        `;
+        
+        const result = await this.adapter.query(query, [id]);
+        return result.rows.map(row => ({
+            id: row.id,
+            content: JSON.parse(row.content),
+            roomId: JSON.parse(row.content).roomId,
+            userId: JSON.parse(row.content).userId,
+            agentId: JSON.parse(row.content).agentId
+        }));
+    }
 
-        return result.rows.length > 0 ? this.mapRowToMemory(result.rows[0]) : null;
+    public async getMemoryVersion(id: UUID, version: number): Promise<Memory | null> {
+        const query = `
+            SELECT id, version, content, created_at
+            FROM ${this.tableName}_versions
+            WHERE id = $1 AND version = $2
+        `;
+        
+        const result = await this.adapter.query(query, [id, version]);
+        if (result.rows.length === 0) return null;
+
+        const row = result.rows[0];
+        return {
+            id: row.id,
+            content: JSON.parse(row.content),
+            roomId: JSON.parse(row.content).roomId,
+            userId: JSON.parse(row.content).userId,
+            agentId: JSON.parse(row.content).agentId
+        };
     }
 
     protected async getMemoryInternal(id: UUID): Promise<Memory | null> {
@@ -496,12 +765,17 @@ export class PostgresMemoryManager extends BaseMemoryManager {
     }
 
     protected async updateMemoryInternal(memory: Memory): Promise<void> {
-        await this.adapter.query(
-            `UPDATE ${this.tableName} 
-             SET content = $1, updated_at = $2
-             WHERE id = $3`,
-            [JSON.stringify(memory.content), Date.now(), memory.id]
-        );
+        const query = `
+            UPDATE ${this.tableName}
+            SET content = $2, updated_at = $3
+            WHERE id = $1
+        `;
+        
+        await this.adapter.query(query, [
+            memory.id,
+            JSON.stringify(memory.content),
+            Date.now()
+        ]);
     }
 
     protected async removeMemoryInternal(id: UUID): Promise<void> {
@@ -509,5 +783,263 @@ export class PostgresMemoryManager extends BaseMemoryManager {
             `DELETE FROM ${this.tableName} WHERE id = $1`,
             [id]
         );
+    }
+
+    /**
+     * Retrieve a single memory with row-level locking using FOR UPDATE.
+     * This ensures exclusive access to the row until the transaction is committed.
+     */
+    public async getMemoryWithLock(id: UUID): Promise<Memory | null> {
+        if (!this.isInTransaction) {
+            throw new Error("getMemoryWithLock must be called within a transaction");
+        }
+
+        try {
+            const result = await this.adapter.query(`
+                SELECT m.*, e.embedding 
+                FROM ${this.tableName} m
+                LEFT JOIN embeddings e ON m.id = e.memory_id
+                WHERE m.id = $1
+                FOR UPDATE
+            `, [id]);
+
+            if (result.rows.length === 0) {
+                return null;
+            }
+
+            return this.mapRowToMemory(result.rows[0]);
+        } catch (error) {
+            elizaLogger.error(`Error in getMemoryWithLock for id ${id}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Retrieve multiple memories with row-level locking using FOR UPDATE.
+     * Supports filtering and ordering by creation time.
+     */
+    public async getMemoriesWithLock(opts: {
+        roomId: UUID;
+        count: number;
+        filter?: Record<string, any>;
+    }): Promise<Memory[]> {
+        try {
+            // Get transaction client
+            await this.beginTransaction();
+
+            let query = `
+                SELECT * FROM ${this.tableName} WHERE room_id = $1
+            `;
+
+            const params: any[] = [opts.roomId];
+            let paramIndex = 2;
+
+            if (opts.filter) {
+                // Log the filter for debugging
+                elizaLogger.debug("MEMORY FILTER IN GETMEMORIESWITHLOCK", {
+                    filter: JSON.stringify(opts.filter),
+                    roomId: opts.roomId,
+                    operation: "getMemoriesWithLock"
+                });
+
+                // Process content.type filter - ensure exact matches
+                if (opts.filter["content.type"]) {
+                    const typeFilter = opts.filter["content.type"];
+                    
+                    // Check if this is a strict type match (from normalizeWalletFilter)
+                    const isExactTypeMatch = typeFilter.$_exact_type_match === true;
+                    
+                    if (typeof typeFilter === 'string') {
+                        // Simple string equality
+                        query += ` AND content->>'type' = $${paramIndex}`;
+                        params.push(typeFilter);
+                        paramIndex++;
+                    } else if (typeFilter.$eq) {
+                        // Explicit equality operator
+                        query += ` AND content->>'type' = $${paramIndex}`;
+                        params.push(typeFilter.$eq);
+                        paramIndex++;
+                        
+                        // Add diagnostic logging for exact type matches
+                        if (isExactTypeMatch) {
+                            elizaLogger.info("EXACT TYPE MATCH FILTER", {
+                                requestedType: typeFilter.$eq,
+                                operation: "getMemoriesWithLock"
+                            });
+                        }
+                    } else if (typeFilter.$in) {
+                        // IN operator for multiple potential types
+                        query += ` AND content->>'type' = ANY($${paramIndex}::text[])`;
+                        params.push(typeFilter.$in);
+                        paramIndex++;
+                    }
+                    
+                    // Handle explicit exclusion of user_message type if specified
+                    if (opts.filter["_not_type"] && opts.filter["_not_type"].$ne) {
+                        query += ` AND content->>'type' != $${paramIndex}`;
+                        params.push(opts.filter["_not_type"].$ne);
+                        paramIndex++;
+                        
+                        elizaLogger.info("EXCLUDING TYPE", {
+                            excludedType: opts.filter["_not_type"].$ne,
+                            operation: "getMemoriesWithLock"
+                        });
+                    }
+                }
+                
+                // Handle direct content type check - this ensures proper JSON path traversal
+                if (opts.filter["_direct_content_type_check"]) {
+                    const directCheck = opts.filter["_direct_content_type_check"];
+                    // Use the JSONB containment operator @> to ensure exact field matching
+                    query += ` AND content @> $${paramIndex}::jsonb`;
+                    // Create a properly nested JSON object for the containment check
+                    const jsonFilter = JSON.stringify({ 
+                        type: directCheck.value 
+                    });
+                    params.push(jsonFilter);
+                    paramIndex++;
+                    
+                    elizaLogger.info("DIRECT CONTENT TYPE CHECK", {
+                        field: directCheck.field,
+                        value: directCheck.value,
+                        jsonFilter,
+                        operation: "getMemoriesWithLock"
+                    });
+                }
+
+                // Process other content.* filters
+                Object.entries(opts.filter).forEach(([key, value]) => {
+                    // Skip already processed filters
+                    if (key === 'content.type' || key === '_not_type') return;
+                    
+                    if (key.startsWith('content.')) {
+                        const path = key.split('.');
+                        
+                        if (path.length === 2) {
+                            const field = path[1];
+                            
+                            if (typeof value === 'object' && value !== null) {
+                                if (value.$eq) {
+                                    // Exact equality
+                                    query += ` AND content->>'${field}' = $${paramIndex}`;
+                                    params.push(value.$eq);
+                                    paramIndex++;
+                                } else if (value.$in) {
+                                    // IN operator
+                                    query += ` AND content->>'${field}' = ANY($${paramIndex}::text[])`;
+                                    params.push(value.$in);
+                                    paramIndex++;
+                                } else if (value.$ne) {
+                                    // NOT EQUAL operator
+                                    query += ` AND content->>'${field}' != $${paramIndex}`;
+                                    params.push(value.$ne);
+                                    paramIndex++;
+                                }
+                            } else {
+                                // Simple equality
+                                query += ` AND content->>'${field}' = $${paramIndex}`;
+                                params.push(value);
+                                paramIndex++;
+                            }
+                        } else if (path.length === 3) {
+                            // Handle nested fields like content.metadata.source
+                            const parent = path[1];
+                            const child = path[2];
+                            
+                            query += ` AND content->'${parent}'->>'${child}' = $${paramIndex}`;
+                            params.push(value);
+                            paramIndex++;
+                        }
+                    }
+                });
+            }
+
+            query += ` ORDER BY created_at DESC LIMIT $${paramIndex}`;
+            params.push(opts.count);
+
+            // Enhanced logging for wallet registration queries
+            if (opts.filter && (
+                (opts.filter["content.type"] && opts.filter["content.type"].$eq === "wallet_registration") ||
+                (opts.filter["content.type"] && opts.filter["content.type"].$eq === "pending_wallet_registration") ||
+                (opts.filter["content.type"] === "wallet_registration") ||
+                (opts.filter["content.type"] === "pending_wallet_registration")
+            )) {
+                elizaLogger.info("EXECUTING WALLET QUERY", {
+                    operation: "getMemoriesWithLock",
+                    sql: query,
+                    params: JSON.stringify(params),
+                    filter: JSON.stringify(opts.filter)
+                });
+            }
+
+            const result = await this.adapter.query(query, params);
+            const memories: Memory[] = result.rows.map(row => {
+                // Ensure proper typing of the memory object
+                return this.mapRowToMemory(row);
+            });
+
+            // Additional diagnostic logging for wallet registration queries
+            if (opts.filter && (
+                (opts.filter["content.type"] && opts.filter["content.type"].$eq === "wallet_registration") ||
+                (opts.filter["content.type"] && opts.filter["content.type"].$eq === "pending_wallet_registration") ||
+                (opts.filter["content.type"] === "wallet_registration") ||
+                (opts.filter["content.type"] === "pending_wallet_registration")
+            )) {
+                const invalidMemories = memories.filter(m => {
+                    // Check if memory has proper content structure before comparing
+                    if (!m || typeof m !== 'object' || !('content' in m) || !m.content || typeof m.content !== 'object' || !('type' in m.content)) {
+                        return true; // This is an invalid memory structure
+                    }
+                    
+                    // Safe type comparison
+                    const requestedType = 
+                        typeof opts.filter["content.type"] === 'object' && opts.filter["content.type"].$eq 
+                            ? opts.filter["content.type"].$eq 
+                            : opts.filter["content.type"];
+                    
+                    return m.content.type !== requestedType;
+                });
+                
+                if (invalidMemories.length > 0) {
+                    elizaLogger.warn("FOUND INVALID RESULTS IN WALLET QUERY", {
+                        foundCount: memories.length,
+                        invalidCount: invalidMemories.length,
+                        types: [...new Set(invalidMemories
+                            .filter(m => m && typeof m === 'object' && 'content' in m && m.content && typeof m.content === 'object' && 'type' in m.content)
+                            .map(m => (m.content as any).type))],
+                        filter: JSON.stringify(opts.filter),
+                        operation: "getMemoriesWithLock"
+                    });
+                } else {
+                    elizaLogger.info("WALLET QUERY SUCCESSFUL", {
+                        foundCount: memories.length,
+                        operation: "getMemoriesWithLock"
+                    });
+                }
+            }
+
+            return memories as Memory[];
+        } catch (error) {
+            elizaLogger.error("Error in getMemoriesWithLock:", error);
+            throw error;
+        } finally {
+            // Release lock
+            await this.commitTransaction();
+        }
+    }
+
+    /**
+     * Legacy method required by BaseMemoryManager - delegates to checkAndEnforceUnique
+     */
+    protected async checkUniqueness(memory: Memory): Promise<boolean> {
+        try {
+            await this.checkAndEnforceUnique(memory);
+            return false; // No existing memory found
+        } catch (error) {
+            if (error.message?.includes('already exists')) {
+                return true; // Existing memory found
+            }
+            throw error; // Re-throw unexpected errors
+        }
     }
 } 

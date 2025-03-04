@@ -1,32 +1,38 @@
 // packages/plugin-solana/src/services/strategyExecutor.ts
 
-import { Service, ServiceType, elizaLogger, stringToUuid, IAgentRuntime } from "@elizaos/core";
-import { StrategyContent, StrategyExecution, PositionUpdate, StrategyExecutionRequest } from "../shared/types/strategy";
-import { SwapRequest } from "../shared/types/treasury";
-import { createStrategyMemoryContent } from "../shared/types/memory";
-import { Position, PositionTracker, StrategyConfig } from "../providers/positionTracker.js";
-import { SwapService } from "../services/swapService.js";
-import { getQuoteForRoute } from "../actions/swap.js";
+import { Service, ServiceType, elizaLogger, stringToUuid, UUID } from "@elizaos/core";
+import { StrategyContent, StrategyExecution, PositionUpdate, StrategyExecutionRequest, PricePoint, Position, StrategyConfig } from "../shared/types/strategy.ts";
+import { SwapRequest } from "../shared/types/treasury.ts";
+import { createStrategyMemoryContent } from "../shared/types/memory.ts";
+import { SwapService } from "../services/swapService.ts";
+import { TreasuryAgent } from "../agents/treasury/TreasuryAgent.ts";
+import { IAgentRuntime as BaseAgentRuntime } from "../shared/types/base.ts";
+import { ModelProviderName, Character, Provider } from "@elizaos/core";
+import { ROOM_IDS } from "../shared/constants.ts";
+import { ExtendedAgentRuntime } from "../shared/utils/runtime.ts";
 
 export class StrategyExecutor extends Service {
     static get serviceType(): ServiceType {
         return "STRATEGY_EXECUTOR" as ServiceType;
     }
 
-    private positionTracker: PositionTracker;
     private swapService: SwapService;
-    private monitoringInterval: NodeJS.Timeout | null = null;
-    protected runtime: IAgentRuntime;
+    private monitoringIntervals: Map<string, NodeJS.Timeout> = new Map();
+    private readonly MONITORING_INTERVAL = 30000; // 30 seconds
+    private readonly PRICE_UPDATE_INTERVAL = 10000; // 10 seconds
+    private readonly MAX_PRICE_AGE = 60000; // 1 minute
+    private lastPriceUpdates: Map<string, { price: number; timestamp: number }> = new Map();
+    protected runtime: ExtendedAgentRuntime;
     private activeMonitoringIntervals: Map<string, NodeJS.Timeout> = new Map();
+    private treasuryAgent: TreasuryAgent | null = null;
+    private positions: Map<string, Position> = new Map();
 
     constructor(
-        runtime: IAgentRuntime,
-        positionTracker: PositionTracker,
+        runtime: ExtendedAgentRuntime,
         swapService: SwapService
     ) {
         super();
         this.runtime = runtime;
-        this.positionTracker = positionTracker;
         this.swapService = swapService;
     }
 
@@ -34,148 +40,280 @@ export class StrategyExecutor extends Service {
         elizaLogger.info("Strategy executor service initialized");
     }
 
-    async startStrategyMonitoring(userId: string): Promise<void> {
-        // Check if monitoring is already active for this user
-        if (this.activeMonitoringIntervals.has(userId)) {
-            elizaLogger.debug(`Strategy monitoring already active for user ${userId}`);
+    async startStrategyMonitoring(strategyId: string): Promise<void> {
+        if (this.monitoringIntervals.has(strategyId)) {
+            elizaLogger.debug(`Strategy ${strategyId} already being monitored`);
             return;
         }
 
         const interval = setInterval(async () => {
-            try {
-                const position = await this.positionTracker.getLatestPosition(userId);
-                if (!position) {
-                    this.stopStrategyMonitoring(userId);
-                    return;
-                }
+            await this.monitorStrategy(strategyId);
+        }, this.MONITORING_INTERVAL);
 
-                const priceInfo = await this.swapService.getTokenPrice(position.token);
-                if (!priceInfo) {
-                    elizaLogger.warn(`Could not get current price for token ${position.token}`);
-                    return;
-                }
-
-                await this.checkAndExecuteExits(position, priceInfo.price, userId);
-            } catch (error) {
-                elizaLogger.error(`Error in strategy monitoring for user ${userId}:`, error);
-            }
-        }, 60000); // Check every minute
-
-        this.activeMonitoringIntervals.set(userId, interval);
-        elizaLogger.info(`Started strategy monitoring for user ${userId}`);
+        this.monitoringIntervals.set(strategyId, interval);
+        elizaLogger.info(`Started monitoring strategy ${strategyId}`);
     }
 
-    stopStrategyMonitoring(userId: string): void {
-        const interval = this.activeMonitoringIntervals.get(userId);
+    async stopStrategyMonitoring(strategyId: string): Promise<void> {
+        const interval = this.monitoringIntervals.get(strategyId);
         if (interval) {
             clearInterval(interval);
-            this.activeMonitoringIntervals.delete(userId);
-            elizaLogger.info(`Stopped strategy monitoring for user ${userId}`);
+            this.monitoringIntervals.delete(strategyId);
+            elizaLogger.info(`Stopped monitoring strategy ${strategyId}`);
         }
     }
 
-    // Add cleanup method for proper shutdown
-    cleanup(): void {
-        for (const [userId, interval] of this.activeMonitoringIntervals.entries()) {
-            clearInterval(interval);
-            elizaLogger.info(`Cleaned up strategy monitoring for user ${userId}`);
+    private async monitorStrategy(strategyId: string): Promise<void> {
+        try {
+            // Get the position associated with this strategy
+            const position = await this.getLatestPosition(strategyId);
+            if (!position || position.status !== 'active') {
+                await this.stopStrategyMonitoring(strategyId);
+                return;
+            }
+
+            // Get current price
+            const currentPrice = await this.getCurrentPrice(position.token);
+            if (!currentPrice) {
+                elizaLogger.warn(`Could not get current price for ${position.token}`);
+                return;
+            }
+
+            // Check and execute strategy conditions
+            await this.checkAndExecuteStrategy(position, currentPrice);
+
+        } catch (error) {
+            elizaLogger.error(`Error monitoring strategy ${strategyId}:`, error);
         }
-        this.activeMonitoringIntervals.clear();
     }
 
-    private async checkAndExecuteExits(position: Position, currentPrice: number, userId: string): Promise<void> {
-        // Update trailing stop if applicable
-        if (position.strategy?.stopLoss?.isTrailing) {
-            const stopLoss = position.strategy.stopLoss;
-            const highestPrice = stopLoss.highestPrice || position.entryPrice;
+    private async getCurrentPrice(token: string): Promise<number | null> {
+        try {
+            const lastUpdate = this.lastPriceUpdates.get(token);
+            const now = Date.now();
 
-            // Update highest price if we have a new high
-            if (currentPrice > highestPrice) {
-                stopLoss.highestPrice = currentPrice;
-                // Update stop loss price to maintain the trailing distance
-                stopLoss.price = currentPrice * (1 - (stopLoss.trailingDistance! / 100));
-
-                elizaLogger.info(`Updated trailing stop for position ${position.id}`, {
-                    newHigh: currentPrice,
-                    newStopPrice: stopLoss.price,
-                    trailingDistance: stopLoss.trailingDistance
-                });
+            // Return cached price if recent enough
+            if (lastUpdate && (now - lastUpdate.timestamp) < this.PRICE_UPDATE_INTERVAL) {
+                return lastUpdate.price;
             }
+
+            // Get fresh price
+            const priceInfo = await this.swapService.getTokenPrice(token);
+            if (!priceInfo || priceInfo.error) {
+                return null;
+            }
+
+            // Cache the new price
+            this.lastPriceUpdates.set(token, {
+                price: priceInfo.price,
+                timestamp: now
+            });
+
+            return priceInfo.price;
+        } catch (error) {
+            elizaLogger.error(`Error getting price for ${token}:`, error);
+            return null;
         }
+    }
 
-        // Check take profit levels
-        for (const tp of position.strategy!.takeProfitLevels) {
-            if (!tp.price || currentPrice < tp.price) continue;
+    private async checkAndExecuteStrategy(position: Position, currentPrice: number): Promise<void> {
+        try {
+            if (!position.strategy) return;
 
-            const sellAmount = (tp.sellAmount / 100) * position.remainingAmount!;
-            const remainingAfterSell = position.remainingAmount! - sellAmount;
-
-            try {
-                const txSignature = await this.swapService.executeSwap(
-                    position.token,
-                    "USDC", // Using USDC as default stable coin
-                    sellAmount,
-                    userId
-                );
-
-                if (await this.swapService.verifyTransaction(txSignature)) {
-                    await this.positionTracker.updatePositionAmount(
-                        position.id,
-                        sellAmount,
-                        remainingAfterSell,
-                        currentPrice,
-                        'take_profit',
-                        txSignature
-                    );
-
-                    elizaLogger.info(`Take profit executed for position ${position.id}`, {
-                        price: currentPrice,
-                        soldAmount: sellAmount,
-                        remaining: remainingAfterSell,
-                        txSignature
-                    });
+            // Check take profit levels
+            if (position.strategy.takeProfitLevels?.length > 0) {
+                for (const tp of position.strategy.takeProfitLevels) {
+                    if (tp.price && currentPrice >= tp.price) {
+                        await this.executeTakeProfit(position, tp, currentPrice);
+                    }
                 }
-            } catch (error) {
-                elizaLogger.error(`Error executing take profit for position ${position.id}:`, error);
             }
-        }
 
-        // Check stop loss
-        if (position.strategy!.stopLoss?.price && currentPrice <= position.strategy!.stopLoss.price) {
-            try {
-                const txSignature = await this.swapService.executeSwap(
-                    position.token,
-                    "USDC",
-                    position.remainingAmount!,
-                    userId
-                );
-
-                if (await this.swapService.verifyTransaction(txSignature)) {
-                    await this.positionTracker.updatePositionAmount(
-                        position.id,
-                        position.remainingAmount!,
-                        0,
-                        currentPrice,
-                        'stop_loss',
-                        txSignature
-                    );
-
-                    elizaLogger.info(`Stop loss executed for position ${position.id}`, {
-                        price: currentPrice,
-                        soldAmount: position.remainingAmount,
-                        txSignature
-                    });
+            // Check stop loss
+            if (position.strategy.stopLoss) {
+                if (position.strategy.stopLoss.isTrailing) {
+                    await this.checkTrailingStop(position, currentPrice);
+                } else if (position.strategy.stopLoss.price && currentPrice <= position.strategy.stopLoss.price) {
+                    await this.executeStopLoss(position, currentPrice);
                 }
-            } catch (error) {
-                elizaLogger.error(`Error executing stop loss for position ${position.id}:`, error);
             }
+
+            // Update position tracking with current price
+            if (position.remainingAmount) {
+                await this.updatePositionAmount(
+                    position.id,
+                    0,
+                    position.remainingAmount,
+                    currentPrice,
+                    'take_profit' // Using take_profit type as it's required by the method signature
+                );
+            }
+
+        } catch (error) {
+            elizaLogger.error(`Error checking strategy for position ${position.id}:`, error);
         }
+    }
+
+    private async checkTrailingStop(position: Position, currentPrice: number): Promise<void> {
+        if (!position.strategy?.stopLoss?.isTrailing || !position.strategy.stopLoss.highestPrice) return;
+
+        // Update highest price if we have a new high
+        if (currentPrice > position.strategy.stopLoss.highestPrice) {
+            const newStopPrice = currentPrice * (1 - (position.strategy.stopLoss.trailingDistance! / 100));
+            
+            // Update position with new high price
+            if (position.remainingAmount) {
+                await this.updatePositionAmount(
+                    position.id,
+                    0,
+                    position.remainingAmount,
+                    currentPrice,
+                    'stop_loss',
+                    stringToUuid(`trailing-${position.id}-${Date.now()}`)
+                );
+            }
+            return;
+        }
+
+        // Check if price has fallen below trailing stop
+        const stopPrice = position.strategy.stopLoss.highestPrice * (1 - (position.strategy.stopLoss.trailingDistance! / 100));
+        if (currentPrice <= stopPrice) {
+            await this.executeStopLoss(position, currentPrice);
+        }
+    }
+
+    private async executeTakeProfit(position: Position, tp: StrategyConfig['takeProfitLevels'][0], currentPrice: number): Promise<void> {
+        try {
+            if (!position.remainingAmount) return;
+
+            const sellAmount = position.remainingAmount * (tp.sellAmount / 100);
+            const remainingAfterSell = position.remainingAmount - sellAmount;
+            
+            await this.createSwapRequest({
+                strategyId: position.id,
+                token: position.token,
+                baseToken: "USDC", // Default to USDC
+                amount: sellAmount.toString(),
+                type: 'take_profit',
+                targetPrice: tp.price || currentPrice,
+                currentPrice
+            });
+
+            // Update position tracking
+            await this.updatePositionAmount(
+                position.id,
+                sellAmount,
+                remainingAfterSell,
+                currentPrice,
+                'take_profit'
+            );
+        } catch (error) {
+            elizaLogger.error(`Error executing take profit for position ${position.id}:`, error);
+        }
+    }
+
+    private async executeStopLoss(position: Position, currentPrice: number): Promise<void> {
+        try {
+            if (!position.remainingAmount) return;
+
+            await this.createSwapRequest({
+                strategyId: position.id,
+                token: position.token,
+                baseToken: "USDC", // Default to USDC
+                amount: position.remainingAmount.toString(),
+                type: 'stop_loss',
+                targetPrice: position.strategy?.stopLoss?.price || currentPrice,
+                currentPrice
+            });
+
+            // Update position tracking
+            await this.updatePositionAmount(
+                position.id,
+                position.remainingAmount,
+                0,
+                currentPrice,
+                'stop_loss'
+            );
+        } catch (error) {
+            elizaLogger.error(`Error executing stop loss for position ${position.id}:`, error);
+        }
+    }
+
+    private async createSwapRequest(params: {
+        strategyId: string;
+        token: string;
+        baseToken: string;
+        amount: string;
+        type: 'take_profit' | 'stop_loss';
+        targetPrice: number;
+        currentPrice: number;
+    }): Promise<void> {
+        const requestId = stringToUuid(`${params.type}-${params.strategyId}-${Date.now()}`);
+        
+        await this.runtime.messageManager.createMemory({
+            id: requestId,
+            content: {
+                type: "swap_request",
+                id: requestId,
+                fromToken: params.token,
+                toToken: params.baseToken,
+                amount: params.amount,
+                reason: params.type,
+                requestId,
+                sourceAgent: "STRATEGY",
+                sourceId: params.strategyId,
+                status: "pending_execution",
+                agentId: this.runtime.agentId,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                text: `${params.type} triggered for ${params.token} at ${params.currentPrice} (target: ${params.targetPrice})`
+            },
+            roomId: ROOM_IDS.TREASURY,
+            userId: this.runtime.agentId,
+            agentId: this.runtime.agentId
+        });
     }
 
     async attachStrategy(position: Position, strategy: StrategyConfig): Promise<void> {
         try {
-            await this.positionTracker.attachStrategy(position, strategy);
-            elizaLogger.info(`Strategy attached to position ${position.id}`, { strategy });
+            // Calculate price levels based on entry price
+            const strategyWithPrices: StrategyConfig = {
+                takeProfitLevels: strategy.takeProfitLevels.map(tp => ({
+                    ...tp,
+                    price: position.entryPrice * (1 + tp.percentage / 100)
+                })),
+                stopLoss: strategy.stopLoss ? {
+                    ...strategy.stopLoss,
+                    price: position.entryPrice * (1 - strategy.stopLoss.percentage / 100)
+                } : undefined
+            };
+
+            const memoryId = stringToUuid(`strategy-${position.id}-${Date.now()}`);
+            await this.runtime.messageManager.createMemory({
+                id: memoryId,
+                content: {
+                    text: `Strategy attached to position ${position.id}`,
+                    type: "strategy",
+                    positionId: position.id,
+                    strategy: strategyWithPrices,
+                    status: "active",
+                    token: position.token,
+                    entryPrice: position.entryPrice,
+                    timestamp: Date.now()
+                },
+                roomId: ROOM_IDS.STRATEGY,
+                userId: stringToUuid(position.userId),
+                agentId: this.runtime.agentId
+            });
+
+            // Update cached position
+            position.strategy = strategyWithPrices;
+            this.positions.set(position.id, position);
+
+            elizaLogger.info(`Strategy attached to position ${position.id}`, {
+                strategy: strategyWithPrices,
+                position
+            });
         } catch (error) {
             elizaLogger.error(`Error attaching strategy to position ${position.id}:`, error);
             throw error;
@@ -189,74 +327,49 @@ export class StrategyExecutor extends Service {
                 throw new Error("Could not determine execution size");
             }
 
-            // Create execution request
-            const request: StrategyExecutionRequest = {
-                type: "strategy_execution_request",
-                id: stringToUuid(`exec-${strategy.id}`),
-                strategyId: strategy.id,
-                token: strategy.token,
-                baseToken: strategy.baseToken,
-                amount: executionSize.toString(),
-                price: position.price,
-                executionType: strategy.strategyType,
-                requestId: stringToUuid(`req-${strategy.id}-${Date.now()}`),
-                text: `Executing ${strategy.strategyType} strategy for ${strategy.token}`,
-                status: "pending_execution",
-                agentId: this.runtime.agentId,
-                createdAt: Date.now(),
-                updatedAt: Date.now()
-            };
-
-            // Create swap request
-            const swapRequest: SwapRequest = {
-                type: "swap_request",
-                id: stringToUuid(`swap-${strategy.id}`),
-                fromToken: position.token,
-                toToken: position.baseToken,
-                amount: executionSize.toString(),
-                reason: "strategy_triggered",
-                requestId: stringToUuid(`req-${strategy.id}-${Date.now()}`),
-                sourceAgent: "STRATEGY",
-                sourceId: strategy.id,
-                status: "pending_execution",
-                text: `Swap request from triggered strategy ${strategy.id}`,
-                agentId: this.runtime.agentId,
-                createdAt: Date.now(),
-                updatedAt: Date.now()
-            };
+            // Create swap request instead of direct execution
+            const requestId = stringToUuid(`exec-${strategy.id}-${Date.now()}`);
+            await this.runtime.messageManager.createMemory({
+                id: requestId,
+                content: {
+                    type: "swap_request",
+                    id: requestId,
+                    inputToken: position.token,
+                    outputToken: position.baseToken,
+                    amount: executionSize,
+                    reason: "strategy_execution",
+                    requestId,
+                    sourceAgent: "STRATEGY",
+                    sourceId: strategy.id,
+                    status: "pending_execution",
+                    agentId: this.runtime.agentId,
+                    createdAt: Date.now(),
+                    updatedAt: Date.now(),
+                    text: `Strategy execution swap for ${strategy.id}`
+                },
+                roomId: ROOM_IDS.TREASURY,
+                userId: this.runtime.agentId,
+                agentId: this.runtime.agentId
+            });
 
             // Create execution tracking memory
             await this.runtime.messageManager.createMemory({
                 id: stringToUuid(`exec-${strategy.id}`),
-                userId: this.runtime.agentId,
-                roomId: this.runtime.agentId,
-                agentId: this.runtime.agentId,
                 content: createStrategyMemoryContent(
-                    "strategy_execution",
-                    `Executing ${strategy.strategyType} strategy for ${position.token}`,
+                    "strategy_execution_request",
+                    `Strategy execution requested for ${position.token}`,
                     "pending_execution",
                     strategy.id,
                     {
                         tags: ["execution", position.token],
-                        priority: "high"
+                        priority: "high",
+                        swapRequestId: requestId
                     }
-                )
-            });
-
-            // Create swap request memory
-            await this.runtime.messageManager.createMemory({
-                id: stringToUuid(`swap-${strategy.id}`),
+                ),
+                roomId: ROOM_IDS.STRATEGY,
                 userId: this.runtime.agentId,
-                roomId: this.runtime.agentId,
-                agentId: this.runtime.agentId,
-                content: swapRequest
+                agentId: this.runtime.agentId
             });
-
-            // Get quote to verify price impact
-            const quote = await getQuoteForRoute(position.token, position.baseToken, executionSize, this.swapService);
-            if (quote.impact > 10) { // 10% max price impact
-                throw new Error(`Price impact too high: ${quote.impact}%`);
-            }
 
             elizaLogger.info(`Strategy execution initiated for ${strategy.id}`);
         } catch (error) {
@@ -321,5 +434,271 @@ export class StrategyExecutor extends Service {
         }
 
         return true;
+    }
+
+    private async ensureTreasuryAgent(): Promise<TreasuryAgent> {
+        if (!this.treasuryAgent) {
+            this.treasuryAgent = new TreasuryAgent(this.runtime);
+            await this.treasuryAgent.initialize();
+        }
+        return this.treasuryAgent;
+    }
+
+    // Position tracking methods
+    async getLatestPosition(userId: string): Promise<Position | null> {
+        try {
+            const swaps = await this.runtime.messageManager.getMemories({
+                roomId: ROOM_IDS.STRATEGY,
+                count: 100
+            });
+
+            // For treasury positions, also include swaps marked as treasury swaps
+            const latestSwap = swaps
+                .filter(m =>
+                    m.userId === userId ||
+                    (userId === this.runtime.agentId && m.content.isTreasurySwap === true)
+                )
+                .find(m => m.content.type === "swap" && m.content.status === "completed");
+
+            if (!latestSwap || !latestSwap.id) {
+                elizaLogger.debug(`No recent swap found for user ${userId}`);
+                return null;
+            }
+
+            // Get position updates to calculate remaining amount
+            const updates = await this.runtime.messageManager.getMemories({
+                roomId: ROOM_IDS.STRATEGY,
+                count: 100
+            });
+
+            const positionUpdates = updates
+                .filter(m =>
+                    m.content.type === "position_update" &&
+                    m.content.positionId === latestSwap.id
+                )
+                .sort((a, b) => (b.content.timestamp as number) - (a.content.timestamp as number));
+
+            const initialAmount = latestSwap.content.outputAmount as number;
+            let remainingAmount = initialAmount;
+            const partialSells = [];
+
+            // Calculate remaining amount and collect partial sells
+            for (const update of positionUpdates) {
+                remainingAmount = update.content.remainingAmount as number;
+                if (update.content.soldAmount) {
+                    partialSells.push({
+                        timestamp: update.content.timestamp as number,
+                        amount: update.content.soldAmount as number,
+                        price: update.content.price as number,
+                        type: update.content.sellType as 'take_profit' | 'stop_loss',
+                        txSignature: update.content.txSignature as string,
+                        profitPercentage: update.content.profitPercentage as number
+                    });
+                }
+            }
+
+            // Get active strategy if exists
+            const strategy = await this.getActiveStrategy(latestSwap.id);
+
+            const position: Position = {
+                id: latestSwap.id,
+                txSignature: latestSwap.content.txSignature as string,
+                token: latestSwap.content.outputToken as string,
+                amount: initialAmount,
+                remainingAmount: remainingAmount,
+                entryPrice: latestSwap.content.entryPrice as number || latestSwap.content.price as number || 0,
+                timestamp: latestSwap.content.timestamp as number,
+                status: remainingAmount > 0 ? 'active' : 'closed',
+                userId,
+                partialSells: partialSells.length > 0 ? partialSells : undefined,
+                strategy: strategy || undefined
+            };
+
+            // Cache the position
+            this.positions.set(position.id, position);
+            return position;
+
+        } catch (error) {
+            elizaLogger.error(`Error getting latest position for user ${userId}:`, error);
+            return null;
+        }
+    }
+
+    async updatePositionAmount(
+        positionId: string,
+        soldAmount: number,
+        remainingAmount: number,
+        price: number,
+        type: 'take_profit' | 'stop_loss',
+        txSignature?: string
+    ): Promise<void> {
+        try {
+            const position = await this.getPositionById(positionId);
+            if (!position) {
+                throw new Error(`Position ${positionId} not found`);
+            }
+
+            const profitPercentage = ((price - position.entryPrice) / position.entryPrice) * 100;
+
+            const memoryId = stringToUuid(`position-update-${positionId}-${Date.now()}`);
+            await this.runtime.messageManager.createMemory({
+                id: memoryId,
+                content: {
+                    text: `Updated position ${positionId} - Sold ${soldAmount} at ${price}`,
+                    type: "position_update",
+                    positionId,
+                    soldAmount,
+                    remainingAmount,
+                    price,
+                    sellType: type,
+                    txSignature,
+                    profitPercentage,
+                    timestamp: Date.now()
+                },
+                roomId: ROOM_IDS.STRATEGY,
+                userId: stringToUuid(this.runtime.agentId),
+                agentId: this.runtime.agentId
+            });
+
+            // Update cached position
+            if (position) {
+                position.remainingAmount = remainingAmount;
+                if (!position.partialSells) position.partialSells = [];
+                position.partialSells.push({
+                    timestamp: Date.now(),
+                    amount: soldAmount,
+                    price,
+                    type,
+                    txSignature,
+                    profitPercentage
+                });
+                this.positions.set(position.id, position);
+            }
+
+            // If position is fully closed, update its status
+            if (remainingAmount <= 0) {
+                await this.updatePositionStatus(positionId, "closed");
+            }
+        } catch (error) {
+            elizaLogger.error(`Error updating position amount for ${positionId}:`, error);
+            throw error;
+        }
+    }
+
+    private async getPositionById(positionId: string): Promise<Position | null> {
+        // Check cache first
+        if (this.positions.has(positionId)) {
+            return this.positions.get(positionId)!;
+        }
+
+        const memories = await this.runtime.messageManager.getMemories({
+            roomId: ROOM_IDS.STRATEGY,
+            count: 100
+        });
+
+        const positionMem = memories.find(m => m.id === positionId);
+        if (!positionMem) return null;
+
+        return this.getLatestPosition(positionMem.userId);
+    }
+
+    async updatePositionStatus(positionId: string, status: 'active' | 'closed'): Promise<void> {
+        try {
+            const memoryId = stringToUuid(`position-status-${positionId}-${Date.now()}`);
+            await this.runtime.messageManager.createMemory({
+                id: memoryId,
+                content: {
+                    text: `Updated position ${positionId} status to ${status}`,
+                    type: "position_status",
+                    positionId,
+                    status,
+                    timestamp: Date.now()
+                },
+                roomId: ROOM_IDS.STRATEGY,
+                userId: stringToUuid(this.runtime.agentId),
+                agentId: this.runtime.agentId
+            });
+
+            // Update cached position
+            const position = await this.getPositionById(positionId);
+            if (position) {
+                position.status = status;
+                this.positions.set(position.id, position);
+            }
+        } catch (error) {
+            elizaLogger.error(`Error updating position ${positionId} status:`, error);
+            throw error;
+        }
+    }
+
+    async getActiveStrategy(positionId: string): Promise<StrategyConfig | null> {
+        try {
+            const memories = await this.runtime.messageManager.getMemories({
+                roomId: ROOM_IDS.STRATEGY,
+                count: 100
+            });
+
+            const strategyMem = memories
+                .filter(m =>
+                    m.content.type === "strategy" &&
+                    m.content.positionId === positionId &&
+                    m.content.status === "active"
+                )
+                .sort((a, b) => (b.content.timestamp as number) - (a.content.timestamp as number))[0];
+
+            if (!strategyMem) return null;
+
+            return strategyMem.content.strategy as StrategyConfig;
+        } catch (error) {
+            elizaLogger.error(`Error getting active strategy for position ${positionId}:`, error);
+            return null;
+        }
+    }
+
+    async cancelStrategy(positionId: string): Promise<void> {
+        try {
+            // Find the original strategy memory
+            const memories = await this.runtime.messageManager.getMemories({
+                roomId: ROOM_IDS.STRATEGY,
+                count: 100
+            });
+
+            const strategyMem = memories.find(m =>
+                m.content.type === "strategy" &&
+                m.content.positionId === positionId &&
+                m.content.status === "active"
+            );
+
+            if (!strategyMem) {
+                elizaLogger.warn(`No active strategy found for position ${positionId}`);
+                return;
+            }
+
+            // Create a new memory with the same ID but updated status
+            await this.runtime.messageManager.createMemory({
+                id: strategyMem.id,
+                content: {
+                    ...strategyMem.content,
+                    text: `Strategy cancelled for position ${positionId}`,
+                    status: "cancelled",
+                    cancelledAt: Date.now()
+                },
+                roomId: ROOM_IDS.STRATEGY,
+                userId: strategyMem.userId,
+                agentId: this.runtime.agentId
+            });
+
+            // Update cached position
+            const position = await this.getPositionById(positionId);
+            if (position) {
+                position.strategy = undefined;
+                this.positions.set(position.id, position);
+            }
+
+            elizaLogger.info(`Strategy cancelled for position ${positionId}`);
+        } catch (error) {
+            elizaLogger.error(`Error cancelling strategy for position ${positionId}:`, error);
+            throw error;
+        }
     }
 }

@@ -1,63 +1,33 @@
-import { UUID, elizaLogger } from "@elizaos/core";
+//packages/plugin-solana/src/shared/constants.ts
+
+import { UUID, elizaLogger, stringToUuid } from "@elizaos/core";
 
 // Define memory domains that map to Eliza's managers
 export const MEMORY_DOMAINS = {
-    // Short-term memory (maps to messageManager)
-    ACTIVE: {
-        PROPOSALS: "active_proposals",
-        STRATEGIES: "active_strategies",
-        TRANSACTIONS: "active_transactions",
-        VOTES: "active_votes"
-    },
-    // Long-term memory (maps to loreManager)
-    ARCHIVE: {
-        PROPOSALS: "archived_proposals",
-        STRATEGIES: "archived_strategies",
-        TRANSACTIONS: "archived_transactions",
-        VOTES: "archived_votes"
-    },
-    // Description memory (maps to descriptionManager)
-    DESCRIPTIONS: {
-        AGENTS: "agent_descriptions",
-        PROPOSALS: "proposal_descriptions",
-        STRATEGIES: "strategy_descriptions"
-    }
-} as const;
+    TRANSACTIONS: "transactions", // Single domain for all memories
+    AGENTS: "agents",            // For agent-specific data
+    SYSTEM: "system"            // For system-level data
+};
 
 // Legacy room IDs - to be deprecated
 export const ROOM_IDS = {
-    DAO: "dao-global-room-0000-0000-0000-000000000000" as UUID,
-    PROPOSAL: "proposal-room-0000-0000-0000-000000000000" as UUID,
-    STRATEGY: "strategy-room-0000-0000-0000-000000000000" as UUID,
-    TREASURY: "treasury-room-0000-0000-0000-000000000000" as UUID,
-    USER: "user-room-0000-0000-0000-000000000000" as UUID
+    DAO: "00000000-0000-0000-0000-000000000001" as UUID,
+    PROPOSAL: "00000000-0000-0000-0000-000000000002" as UUID,
+    STRATEGY: "00000000-0000-0000-0000-000000000003" as UUID,
+    TREASURY: "00000000-0000-0000-0000-000000000004" as UUID,
+    USER: "00000000-0000-0000-0000-000000000005" as UUID
 } as const;
 
 // Helper to determine appropriate memory domain for a memory type
 export function getMemoryDomain(type: string): string {
-    // Active/recent memories
-    if (type.startsWith("active_") || 
-        type.includes("_request") || 
-        type.includes("_pending")) {
-        return MEMORY_DOMAINS.ACTIVE[type.split('_')[1].toUpperCase()] || MEMORY_DOMAINS.ACTIVE.TRANSACTIONS;
+    // Use appropriate domain based on memory type
+    if (type.startsWith('agent_') || type.endsWith('_agent')) {
+        return MEMORY_DOMAINS.AGENTS;
     }
-    
-    // Archived/completed memories
-    if (type.startsWith("archived_") || 
-        type.includes("_completed") || 
-        type.includes("_executed")) {
-        return MEMORY_DOMAINS.ARCHIVE[type.split('_')[1].toUpperCase()] || MEMORY_DOMAINS.ARCHIVE.TRANSACTIONS;
+    if (type.startsWith('system_') || type.endsWith('_system')) {
+        return MEMORY_DOMAINS.SYSTEM;
     }
-    
-    // Descriptive memories
-    if (type.includes("_description") || 
-        type.includes("_metadata") || 
-        type.includes("_config")) {
-        return MEMORY_DOMAINS.DESCRIPTIONS[type.split('_')[0].toUpperCase()] || MEMORY_DOMAINS.DESCRIPTIONS.AGENTS;
-    }
-    
-    // Default to active transactions for unknown types
-    return MEMORY_DOMAINS.ACTIVE.TRANSACTIONS;
+    return MEMORY_DOMAINS.TRANSACTIONS;
 }
 
 // Helper to determine if a memory should be archived
@@ -103,9 +73,10 @@ export const MEMORY_TYPES = {
 
 // Stable agent IDs
 export const AGENT_IDS = {
-    PROPOSAL: "agent-proposal-0000-0000-0000-000000000000" as UUID,
-    STRATEGY: "agent-strategy-0000-0000-0000-000000000000" as UUID,
-    TREASURY: "agent-treasury-0000-0000-0000-000000000000" as UUID
+    PROPOSAL: "00000000-0000-0000-0001-000000000000" as UUID,
+    STRATEGY: "00000000-0000-0000-0002-000000000000" as UUID,
+    TREASURY: "00000000-0000-0000-0003-000000000000" as UUID,
+    USER: "00000000-0000-0000-0004-000000000000" as UUID
 } as const;
 
 // Memory types that are always stored in agent's personal room
@@ -128,6 +99,9 @@ export const MEMORY_ROOM_MAPPING: Record<string, UUID | 'AGENT_ROOM'> = {
     vote: ROOM_IDS.DAO,
     treasury_transaction: ROOM_IDS.DAO,
     wallet_registration: ROOM_IDS.DAO,
+    user_profile: ROOM_IDS.DAO,
+    reputation_update: ROOM_IDS.DAO,
+    activity_log: ROOM_IDS.DAO,
 
     // Execution records (global visibility)
     proposal_execution: ROOM_IDS.DAO,

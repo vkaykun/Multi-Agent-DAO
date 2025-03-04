@@ -1,18 +1,18 @@
-import { elizaLogger, Memory, UUID, stringToUuid } from "@elizaos/core";
-import { MemoryEvent } from "./types/memory-events";
-import { ROOM_IDS } from "./constants";
+import { Memory, elizaLogger } from "@elizaos/core";
+import { MemoryEvent } from "./types/memory-events.ts";
 import { EventEmitter } from "events";
 
 /**
- * MessageBroker is responsible for broadcasting memory events to other processes.
- * It uses Eliza's built-in memory system rather than maintaining its own subscriptions.
+ * MessageBroker is responsible for local event broadcasting.
+ * Cross-process memory sync is handled by MemorySyncManager.
  */
-export class MessageBroker {
+export class MessageBroker extends EventEmitter {
     private static instance: MessageBroker;
-    private eventEmitter: EventEmitter;
+    private subscribers: Map<string, Set<(event: MemoryEvent) => Promise<void>>>;
 
     private constructor() {
-        this.eventEmitter = new EventEmitter();
+        super();
+        this.subscribers = new Map();
     }
 
     public static getInstance(): MessageBroker {
@@ -22,51 +22,62 @@ export class MessageBroker {
         return MessageBroker.instance;
     }
 
-    public on(event: string, callback: (...args: any[]) => void): void {
-        this.eventEmitter.on(event, callback);
+    public subscribe(type: string, callback: (event: MemoryEvent) => Promise<void>): void {
+        if (!this.subscribers.has(type)) {
+            this.subscribers.set(type, new Set());
+        }
+        this.subscribers.get(type)?.add(callback);
     }
 
-    public emit(event: string, ...args: any[]): void {
-        this.eventEmitter.emit(event, ...args);
+    public unsubscribe(type: string, callback: (event: MemoryEvent) => Promise<void>): void {
+        this.subscribers.get(type)?.delete(callback);
     }
 
-    public subscribe(event: string, callback: (...args: any[]) => void): void {
-        this.eventEmitter.on(event, callback);
+    private async notifySubscribers(type: string, event: MemoryEvent): Promise<void> {
+        const callbacks = this.subscribers.get(type);
+        if (!callbacks) return;
+
+        const errors: Error[] = [];
+        await Promise.all(Array.from(callbacks).map(async (callback) => {
+            try {
+                await callback(event);
+            } catch (error) {
+                errors.push(error as Error);
+                elizaLogger.error(`Error in memory event subscriber:`, error);
+            }
+        }));
+
+        if (errors.length > 0) {
+            elizaLogger.error(`${errors.length} errors occurred while notifying subscribers`);
+        }
     }
 
     /**
-     * Broadcast a memory event to other processes through the memory system
+     * Broadcasts an event to local subscribers only.
+     * For cross-process sync, use MemorySyncManager.
      */
     public async broadcast(event: MemoryEvent): Promise<void> {
         try {
-            // Create memory for the event in the global room
-            const memory: Memory = {
-                id: stringToUuid(`event-${event.content.id}-${Date.now()}`),
-                content: {
-                    type: "memory_event",
-                    ...event,
-                    text: `Memory event: ${event.type} for ${event.content.type}`,
-                    createdAt: Date.now(),
-                    updatedAt: Date.now()
-                },
-                roomId: ROOM_IDS.DAO,
-                userId: event.agentId,
-                agentId: event.agentId
-            };
-
-            // Let Eliza's memory system handle the distribution
-            if (process.send) {
-                process.send({
-                    type: "memory_sync",
-                    operation: "create",
-                    memory,
-                    timestamp: Date.now(),
-                    processId: process.pid
-                });
-            }
+            // Notify local subscribers
+            await this.notifySubscribers(event.type, {
+                ...event,
+                memory: {
+                    id: event.content.id,
+                    content: event.content,
+                    roomId: event.roomId,
+                    userId: event.agentId,
+                    agentId: event.agentId,
+                    createdAt: event.timestamp || Date.now()
+                }
+            });
         } catch (error) {
-            elizaLogger.error("Error broadcasting memory event:", error);
+            elizaLogger.error("Error broadcasting event:", error);
             throw error;
         }
+    }
+
+    public async emitAsync(type: string, event: MemoryEvent): Promise<boolean> {
+        await this.broadcast(event);
+        return true;
     }
 } 

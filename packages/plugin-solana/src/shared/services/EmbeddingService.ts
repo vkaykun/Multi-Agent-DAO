@@ -1,3 +1,5 @@
+// packages/plugin-solana/src/shared/services/EmbeddingService.ts
+
 import { IAgentRuntime, elizaLogger, Service, ServiceType } from "@elizaos/core";
 
 export interface EmbeddingConfig {
@@ -17,10 +19,13 @@ export class EmbeddingService {
         private runtime: IAgentRuntime,
         config: Partial<EmbeddingConfig>
     ) {
+        // Check both old and new embedding control flags
+        const isDisabled = process.env.DISABLE_EMBEDDINGS?.toLowerCase() === "true";
+        
         this.config = {
-            enabled: process.env.USE_EMBEDDINGS === "true",
-            dimension: parseInt(process.env.EMBEDDING_DIMENSION || "1536"),
-            modelName: process.env.EMBEDDING_MODEL,
+            enabled: !isDisabled && process.env.USE_EMBEDDINGS === "true",
+            dimension: process.env.VECTOR_DIMENSION ? parseInt(process.env.VECTOR_DIMENSION) : 1536, // Use 1536 dimensions to match OpenAI text-embedding-ada-002 model
+            modelName: process.env.EMBEDDING_MODEL || "text-embedding-ada-002",
             batchSize: parseInt(process.env.EMBEDDING_BATCH_SIZE || "10"),
             cacheResults: process.env.CACHE_EMBEDDINGS === "true",
             ...config
@@ -28,6 +33,9 @@ export class EmbeddingService {
 
         if (this.config.enabled) {
             this.initializeService();
+            elizaLogger.info(`Embeddings enabled with dimension: ${this.config.dimension}, model: ${this.config.modelName}`);
+        } else {
+            elizaLogger.info("Embeddings disabled via environment settings");
         }
     }
 
@@ -63,19 +71,86 @@ export class EmbeddingService {
     }
 
     public async getEmbedding(text: string): Promise<number[] | null> {
+        // If service is disabled or no text provided
         if (!this.isEnabled() || !text) {
+            // Return a zero vector instead of null for better compatibility
+            if (process.env.DISABLE_EMBEDDINGS?.toLowerCase() === "true") {
+                elizaLogger.debug("Embeddings disabled, returning zero vector");
+                return new Array(this.config.dimension).fill(0);
+            }
             return null;
         }
 
         try {
-            return await this.textGenService!.getEmbeddingResponse(text);
+            const embedding = await this.textGenService!.getEmbeddingResponse(text);
+            
+            // Validate embedding dimension
+            if (embedding.length !== this.config.dimension) {
+                elizaLogger.warn(`Embedding dimension mismatch: expected ${this.config.dimension}, got ${embedding.length}`);
+                
+                // If adaptation is enabled, try to adapt the vector
+                if (process.env.VECTOR_DIMENSION_ADAPT === "true") {
+                    return this.adaptVectorDimension(embedding, this.config.dimension);
+                }
+            }
+            
+            return embedding;
         } catch (error) {
             elizaLogger.error("Error generating embedding:", error);
-            return null;
+            // Return a zero vector on error for better fault tolerance
+            return new Array(this.config.dimension).fill(0);
         }
     }
 
+    /**
+     * Adapts a vector to the target dimension by repeating or averaging values
+     */
+    private adaptVectorDimension(vector: number[], targetDimension: number): number[] {
+        if (vector.length === targetDimension) return vector;
+        
+        elizaLogger.info(`Adapting vector from ${vector.length}D to ${targetDimension}D`);
+        
+        // Convert from 384 to 1536 (upscale)
+        if (vector.length === 384 && targetDimension === 1536) {
+            // Repeat each value 4 times to fill the larger dimension
+            const newVector = [];
+            for (let i = 0; i < vector.length; i++) {
+                for (let j = 0; j < 4; j++) {
+                    newVector.push(vector[i]);
+                }
+            }
+            return newVector;
+        }
+        
+        // Convert from 1536 to 384 (downscale)
+        if (vector.length === 1536 && targetDimension === 384) {
+            // Take average of each group of 4 values
+            const newVector = [];
+            for (let i = 0; i < vector.length; i += 4) {
+                const avg = (vector[i] + vector[i+1] + vector[i+2] + vector[i+3]) / 4;
+                newVector.push(avg);
+            }
+            return newVector;
+        }
+        
+        // Fallback for other dimensions: simple scaling
+        const newVector = new Array(targetDimension).fill(0);
+        for (let i = 0; i < targetDimension; i++) {
+            const sourceIndex = Math.floor(i * (vector.length / targetDimension));
+            newVector[i] = vector[sourceIndex];
+        }
+        
+        return newVector;
+    }
+
     public async getEmbeddingsBatch(texts: string[]): Promise<(number[] | null)[]> {
+        // If embeddings are globally disabled, return zero vectors
+        if (process.env.DISABLE_EMBEDDINGS?.toLowerCase() === "true") {
+            elizaLogger.debug("Embeddings disabled, returning zero vectors for batch");
+            return texts.map(() => new Array(this.config.dimension).fill(0));
+        }
+        
+        // Otherwise use normal disabled logic
         if (!this.isEnabled() || texts.length === 0) {
             return texts.map(() => null);
         }

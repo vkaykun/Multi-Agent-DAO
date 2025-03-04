@@ -1,3 +1,5 @@
+// packages/core/src/generation.ts
+
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createMistral } from "@ai-sdk/mistral";
@@ -373,6 +375,7 @@ export async function generateText({
         modelProvider: runtime.modelProvider,
         model: modelClass,
         verifiableInference,
+        actualModelName: models[runtime.modelProvider].model[modelClass].name
     });
     elizaLogger.log("Using provider:", runtime.modelProvider);
     // If verifiable inference is requested and adapter is provided, use it
@@ -1327,42 +1330,82 @@ export async function generateShouldRespond({
     context: string;
     modelClass: ModelClass;
 }): Promise<"RESPOND" | "IGNORE" | "STOP" | null> {
-    let retryDelay = 1000;
-    while (true) {
-        try {
-            elizaLogger.debug(
-                "Attempting to generate text with context:",
-                context
-            );
-            const response = await generateText({
-                runtime,
-                context,
-                modelClass,
-            });
+    try {
+        // Add detailed logging for runtime configuration
+        elizaLogger.info("Runtime configuration:", {
+            modelProvider: runtime.modelProvider,
+            availableProviders: Object.keys(models),
+            modelClass,
+            hasModelProvider: !!runtime.modelProvider,
+            isValidProvider: !!models[runtime.modelProvider],
+            modelSettings: models[runtime.modelProvider]?.model?.[modelClass]
+        });
 
-            elizaLogger.debug("Received response from generateText:", response);
-            const parsedResponse = parseShouldRespondFromText(response.trim());
-            if (parsedResponse) {
-                elizaLogger.debug("Parsed response:", parsedResponse);
-                return parsedResponse;
-            } else {
-                elizaLogger.debug("generateShouldRespond no response");
-            }
-        } catch (error) {
-            elizaLogger.error("Error in generateShouldRespond:", error);
-            if (
-                error instanceof TypeError &&
-                error.message.includes("queueTextCompletion")
-            ) {
-                elizaLogger.error(
-                    "TypeError: Cannot read properties of null (reading 'queueTextCompletion')"
-                );
-            }
+        // Add defensive checks
+        if (!runtime.modelProvider) {
+            throw new Error("Model provider not set in runtime");
         }
 
-        elizaLogger.log(`Retrying in ${retryDelay}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, retryDelay));
-        retryDelay *= 2;
+        if (!models[runtime.modelProvider]) {
+            throw new Error(`Invalid model provider: ${runtime.modelProvider}. Available providers: ${Object.keys(models).join(", ")}`);
+        }
+
+        if (!models[runtime.modelProvider].model) {
+            throw new Error(`No model configuration found for provider: ${runtime.modelProvider}`);
+        }
+
+        if (!models[runtime.modelProvider].model[modelClass]) {
+            throw new Error(`No model settings found for class ${modelClass} in provider ${runtime.modelProvider}`);
+        }
+
+        elizaLogger.info("Generating should respond with options:", {
+            modelProvider: runtime.modelProvider,
+            modelClass,
+            actualModelName: models[runtime.modelProvider].model[modelClass].name,
+            endpoint: models[runtime.modelProvider].endpoint
+        });
+
+        const response = await generateText({
+            runtime,
+            context,
+            modelClass,
+        });
+
+        elizaLogger.debug("Raw response from model:", {
+            response,
+            responseLength: response?.length,
+            responseType: typeof response
+        });
+
+        const result = parseShouldRespondFromText(response);
+        elizaLogger.debug("Parsed result:", {
+            result,
+            isValidResult: result === "RESPOND" || result === "IGNORE" || result === "STOP",
+            originalResponse: response
+        });
+        return result;
+    } catch (error) {
+        const errorDetails = error instanceof Error ? {
+            message: error.message,
+            stack: error.stack,
+            name: error.name,
+            cause: error.cause
+        } : error;
+
+        elizaLogger.error("Error in generateShouldRespond:", {
+            error: errorDetails,
+            context: {
+                modelProvider: runtime.modelProvider,
+                modelClass,
+                modelName: models[runtime.modelProvider]?.model?.[modelClass]?.name || 'unknown',
+                contextLength: context?.length,
+                hasRuntime: !!runtime,
+                hasModelSettings: !!models[runtime.modelProvider]?.model?.[modelClass],
+                availableProviders: Object.keys(models),
+                runtimeKeys: Object.keys(runtime)
+            }
+        });
+        return null;
     }
 }
 
@@ -1427,18 +1470,18 @@ export async function generateTrueOrFalse({
 
     while (true) {
         try {
-            const response = await generateText({
+        const response = await generateText({
                 stop,
-                runtime,
-                context,
-                modelClass,
-            });
+            runtime,
+            context,
+            modelClass,
+        });
 
             const parsedResponse = parseBooleanFromText(response.trim());
             if (parsedResponse !== null) {
                 return parsedResponse;
             }
-        } catch (error) {
+    } catch (error) {
             elizaLogger.error("Error in generateTrueOrFalse:", error);
         }
 
@@ -1465,7 +1508,7 @@ export async function generateTrueOrFalse({
 export async function generateTextArray({
     runtime,
     context,
-    modelClass,
+            modelClass,
 }: {
     runtime: IAgentRuntime;
     context: string;

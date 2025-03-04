@@ -4,20 +4,15 @@ import { elizaLogger } from "@elizaos/core";
 import { PublicKey } from "@solana/web3.js";
 
 // Validates if a string is a valid Solana address
-export const isValidSolanaAddress = (address: string): boolean => {
-    // First do a basic format check before trying PublicKey
-    const base58Pattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-    if (!base58Pattern.test(address)) {
+export function isValidSolanaAddress(address: string): boolean {
+    if (!address || typeof address !== 'string') {
         return false;
     }
 
-    try {
-        new PublicKey(address);
-        return true;
-    } catch {
-        return false;
-    }
-};
+    // Simple check for base58 encoding (alphanumeric without 0, O, I, l)
+    const base58Regex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+    return base58Regex.test(address);
+}
 
 // Validates if a string is a valid Solana transaction signature
 export const isValidTransactionSignature = (signature: string): boolean => {
@@ -47,6 +42,17 @@ export const validateCommand = (text: string, command: string): boolean => {
     return isValid;
 };
 
+// Extract a wallet address from any text
+export function extractWalletAddress(text: string): string | null {
+    if (!text || typeof text !== 'string') {
+        return null;
+    }
+    
+    // Look for a valid Solana address format
+    const match = text.match(/\b([1-9A-HJ-NP-Za-km-z]{32,44})\b/);
+    return match ? match[1] : null;
+}
+
 // For commands that require parameters (like register and verify)
 export const validateCommandWithParam = (text: string, command: string, paramPattern: string): RegExpMatchArray | null => {
     // Handle special cases for different commands
@@ -57,12 +63,35 @@ export const validateCommandWithParam = (text: string, command: string, paramPat
         case "register":
             parameterPattern = "[1-9A-HJ-NP-Za-km-z]{32,44}"; // Solana address format
             additionalValidation = isValidSolanaAddress;
-            // Fixed pattern to handle all variations of wallet commands
+            
+            // First try the formal command format
             const registerPattern = new RegExp(
-                `^(?:(?:<@!?\\d+>|@\\d+)\\s*)?!${command}\\s+(?:(?:my\\s+)?wallet\\s+)?(${parameterPattern})\\s*$`,
+                `^(?:(?:<@!?\\d+>|@\\d+)\\s*)?!?${command}\\s+(?:(?:my\\s+)?wallet\\s+)?(${parameterPattern})\\s*$`,
                 "i"
             );
-            return text.match(registerPattern);
+            let match = text.match(registerPattern);
+            
+            // If formal pattern fails, try natural language extraction
+            if (!match) {
+                const naturalLanguagePattern = new RegExp(
+                    `^(?:(?:<@!?\\d+>|@\\w+)\\s*)?(?:please\\s+)?(?:can\\s+you\\s+)?${command}\\s+(?:my|this)\\s+wallet\\s+(?:address\\s+)?([1-9A-HJ-NP-Za-km-z]{32,44})`,
+                    "i"
+                );
+                match = text.match(naturalLanguagePattern);
+                
+                // If still no match, try to find any valid wallet address in the text
+                if (!match && text.toLowerCase().includes("register") && text.toLowerCase().includes("wallet")) {
+                    const extractedAddress = extractWalletAddress(text);
+                    if (extractedAddress) {
+                        // Construct a synthetic match result
+                        elizaLogger.debug(`[Register Command] Extracted wallet address using fallback method: ${extractedAddress}`);
+                        return [text, extractedAddress];
+                    }
+                }
+            }
+            
+            return match;
+            
         case "verify":
             parameterPattern = "[1-9A-HJ-NP-Za-km-z]{88}"; // Transaction signature format
             additionalValidation = isValidTransactionSignature;
@@ -77,7 +106,7 @@ export const validateCommandWithParam = (text: string, command: string, paramPat
     // 2. <@123456789> !command <param> (Discord mention with brackets)
     // 3. @123456789 !command <param> (Discord mention without brackets)
     const commandPattern = new RegExp(
-        `^(?:(?:<@!?\\d+>|@\\d+)\\s*)?!${command}\\s+(${parameterPattern})\\s*$`,
+        `^(?:(?:<@!?\\d+>|@\\d+)\\s*)?!?${command}\\s+(${parameterPattern})\\s*$`,
         "i"
     );
 
@@ -109,13 +138,84 @@ export const validateCommandWithParam = (text: string, command: string, paramPat
 };
 
 // Helper function to extract command and parameters from text
-export const parseCommand = (text: string): { command: string; params: string[] } | null => {
-    const commandMatch = text.trim().match(/^(?:<@!?\d+>|@\d+)?\s*!(\w+)(.*)/i);
-    if (!commandMatch) return null;
-
-    const command = commandMatch[1].toLowerCase();
-    const paramString = commandMatch[2].trim();
-    const params = paramString ? paramString.split(/\s+/) : [];
-
+export function parseCommand(text: string): { command: string; params: string[] } {
+    text = text.trim();
+    const parts = text.split(/\s+/);
+    const command = parts[0].toLowerCase();
+    const params = parts.slice(1);
+    
     return { command, params };
-};
+}
+
+// Add imports if needed
+export function validateActionCommand(
+    message: any,
+    runtime: any,
+    actionName: string,
+    prefixes: string[], 
+    keywords: string[]
+): { isValid: boolean; extractedText: string | null } {
+    try {
+        const messageText = message.content?.text || "";
+        
+        // Skip empty messages
+        if (!messageText.trim()) {
+            return { isValid: false, extractedText: null };
+        }
+        
+        // For tokeninfo, apply stricter validation to avoid false positives
+        if (actionName === "tokeninfo") {
+            // Exclude common conversational patterns that might trigger false positives
+            const conversationalPatterns = [
+                /^(?:hi|hey|hello|sup|yo|hru|how are you|how r u|good morning|good afternoon|good evening|whats up|what's up|howdy)/i,
+                /^(?:thanks|thank you|ty|thx)/i,
+                /^(?:nice|cool|awesome|great|good)/i,
+                /^(?:hmm|huh|oh|ah|wow|hmm+|oh+)/i,
+                /^(?:yes|no|maybe|sure|okay|ok|yep|nope|nah)/i,
+                /^(?:lol|haha|lmao|rofl)/i,
+                /^(?:can you|could you|would you|do you|are you|will you)/i,
+                /^(?:tell me about(?!\s+price|\s+token|\s+volume|\s+liquidity|\s+market))/i,
+                /^(?:what do you|who are you|what are you)/i,
+                /^(?:i think|i believe|i feel|i want|i need)/i
+            ];
+            
+            // Check if message matches any conversational pattern
+            for (const pattern of conversationalPatterns) {
+                if (pattern.test(messageText.trim().toLowerCase())) {
+                    return { isValid: false, extractedText: null };
+                }
+            }
+            
+            // For tokeninfo, validate that the message contains token-related keywords
+            const tokenPatterns = [
+                /\b(?:price|cost|rate|value)\b.*?\b(?:of|for|on)\b/i,
+                /\b(?:volume|liquidity|market\s*cap|mcap|tvl)\b/i,
+                /\b(?:sol|btc|eth|usdc|usdt|bonk|jup|ray|msol)\b/i,
+                /\b[A-HJ-NP-Za-km-z1-9]{32,44}\b/i // Solana address pattern
+            ];
+            
+            // Require at least one token pattern match for tokeninfo
+            const hasTokenPattern = tokenPatterns.some(pattern => pattern.test(messageText));
+            if (!hasTokenPattern) {
+                return { isValid: false, extractedText: null };
+            }
+        }
+        
+        // Continue with normal validation
+        const prefixMatched = prefixes.some(prefix => 
+            messageText.toLowerCase().includes(prefix.toLowerCase())
+        );
+        
+        const keywordMatched = keywords.some(keyword => 
+            messageText.toLowerCase().includes(keyword.toLowerCase())
+        );
+        
+        return {
+            isValid: prefixMatched || keywordMatched || message.content?.action === actionName,
+            extractedText: messageText
+        };
+    } catch (error) {
+        console.error("Error in validateActionCommand:", error);
+        return { isValid: false, extractedText: null };
+    }
+}

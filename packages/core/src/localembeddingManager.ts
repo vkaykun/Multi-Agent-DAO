@@ -150,10 +150,48 @@ class LocalEmbeddingModelManager {
             );
         }
 
-        if (finalEmbedding.length !== 384) {
-            elizaLogger.warn(
-                `Unexpected embedding dimension: ${finalEmbedding.length}`
+        // Handle dimension conversion from BGE's 384 to the required 1536 for consistency
+        if (finalEmbedding.length !== 1536) {
+            const originalDimension = finalEmbedding.length;
+            
+            elizaLogger.info(
+                `Converting embedding dimension from ${originalDimension} to 1536`
             );
+            
+            if (finalEmbedding.length === 384) {
+                // For the common case of 384D embeddings, ensure we handle it properly
+                // Create a full 1536D vector by repeating and scaling the original
+                // This preserves the semantic information better than zero-padding
+                const repeatedEmbedding: number[] = [];
+                for (let i = 0; i < 4; i++) {
+                    repeatedEmbedding.push(...finalEmbedding);
+                }
+                
+                // Now we have a 1536D vector (384 * 4)
+                finalEmbedding = repeatedEmbedding;
+                
+                // Normalize to maintain similar magnitude
+                const normFactor = Math.sqrt(4); // since we're repeating 4 times
+                finalEmbedding = finalEmbedding.map(val => val / normFactor);
+            } else if (finalEmbedding.length < 1536) {
+                // For other cases, pad with zeros
+                elizaLogger.debug(`Padding embedding from ${finalEmbedding.length}D to 1536D with zeros`);
+                const padding = new Array(1536 - finalEmbedding.length).fill(0);
+                finalEmbedding = [...finalEmbedding, ...padding];
+            } else {
+                // Truncate if somehow larger than 1536
+                elizaLogger.debug(`Truncating embedding from ${finalEmbedding.length}D to 1536D`);
+                finalEmbedding = finalEmbedding.slice(0, 1536);
+            }
+            
+            // Verify we have the right dimensions now
+            if (finalEmbedding.length !== 1536) {
+                elizaLogger.error(`Dimension conversion failed! Expected 1536, got ${finalEmbedding.length}`);
+                // Force correct dimensions as a last resort
+                finalEmbedding = Array(1536).fill(0);
+            } else {
+                elizaLogger.debug(`Successfully converted to 1536D embedding`);
+            }
         }
 
         return finalEmbedding;

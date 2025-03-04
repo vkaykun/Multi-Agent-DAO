@@ -17,7 +17,7 @@ import { elizaLogger } from './logger.js';
  * An abstract class representing a database adapter for managing various entities
  * like accounts, memories, actors, goals, and rooms.
  */
-export abstract class DatabaseAdapter<DB = any> implements IDatabaseAdapter {
+export abstract class IDatabaseCacheAdapter<DB = any> implements IDatabaseAdapter {
     /**
      * The database instance.
      */
@@ -341,13 +341,6 @@ export abstract class DatabaseAdapter<DB = any> implements IDatabaseAdapter {
     abstract getParticipantsForAccount(userId: UUID): Promise<Participant[]>;
 
     /**
-     * Retrieves participants associated with a specific account.
-     * @param userId The UUID of the account.
-     * @returns A Promise that resolves to an array of Participant objects.
-     */
-    abstract getParticipantsForAccount(userId: UUID): Promise<Participant[]>;
-
-    /**
      * Retrieves participants for a specific room.
      * @param roomId The UUID of the room for which to retrieve participants.
      * @returns A Promise that resolves to an array of UUIDs representing the participants.
@@ -457,4 +450,49 @@ export abstract class DatabaseAdapter<DB = any> implements IDatabaseAdapter {
             throw error;
         }
     }
+
+    /**
+     * Begins a database transaction
+     */
+    abstract beginTransaction(): Promise<void>;
+
+    /**
+     * Commits the current database transaction
+     */
+    abstract commitTransaction(): Promise<void>;
+
+    /**
+     * Rolls back the current database transaction
+     */
+    abstract rollbackTransaction(): Promise<void>;
+
+    /**
+     * Gets memories with pagination support
+     */
+    abstract getMemoriesWithPagination(params: {
+        roomId: UUID;
+        limit?: number;
+        cursor?: UUID;
+        startTime?: number;
+        endTime?: number;
+        tableName: string;
+        agentId: UUID;
+    }): Promise<{
+        items: Memory[];
+        hasMore: boolean;
+        nextCursor?: UUID;
+    }>;
+
+    /**
+     * Executes a raw database query
+     */
+    abstract query(sql: string, params?: any[]): Promise<any>;
+
+    /**
+     * Updates an existing memory in the database.
+     * @param memory The memory object to update.
+     * @param tableName The table where the memory is stored.
+     * @returns A Promise that resolves when the memory has been updated.
+     */
+    abstract updateMemory(memory: Memory, tableName: string): Promise<void>;
 }

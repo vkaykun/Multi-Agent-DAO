@@ -591,9 +591,11 @@ export class VoiceManager extends EventEmitter {
             const wavBuffer = await this.convertOpusToWav(inputBuffer);
             console.log("Starting transcription...");
 
+            // Convert Buffer to ArrayBuffer before transcription
+            const arrayBuffer = wavBuffer.buffer.slice(wavBuffer.byteOffset, wavBuffer.byteOffset + wavBuffer.byteLength) as ArrayBuffer;
             const transcriptionText = await this.runtime
                 .getService<ITranscriptionService>(ServiceType.TRANSCRIPTION)
-                .transcribe(wavBuffer);
+                .transcribe(arrayBuffer);
 
             function isValidTranscription(text: string): boolean {
                 if (!text || text.includes("[BLANK_AUDIO]")) return false;

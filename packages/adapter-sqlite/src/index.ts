@@ -2,7 +2,7 @@ export * from "./sqliteTables.ts";
 export * from "./sqlite_vec.ts";
 
 import {
-    DatabaseAdapter,
+    IDatabaseAdapter,
     elizaLogger,
     type IDatabaseCacheAdapter,
 } from "@elizaos/core";
@@ -23,16 +23,88 @@ import { v4 } from "uuid";
 import { load } from "./sqlite_vec.ts";
 import { sqliteTables } from "./sqliteTables.ts";
 
-export class SqliteDatabaseAdapter
-    extends DatabaseAdapter<Database>
-    implements IDatabaseCacheAdapter
-{
+class CircuitBreaker {
+    private state: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
+    private failureCount = 0;
+    private lastFailureTime = 0;
+
+    constructor(private config: {
+        failureThreshold: number;
+        resetTimeout: number;
+        halfOpenMaxAttempts: number;
+    }) {}
+
+    async execute<T>(operation: () => Promise<T>): Promise<T> {
+        if (this.state === 'OPEN') {
+            if (Date.now() - this.lastFailureTime >= this.config.resetTimeout) {
+                this.state = 'HALF_OPEN';
+            } else {
+                throw new Error('Circuit breaker is OPEN');
+            }
+        }
+
+        try {
+            const result = await operation();
+            if (this.state === 'HALF_OPEN') {
+                this.state = 'CLOSED';
+                this.failureCount = 0;
+            }
+            return result;
+        } catch (error) {
+            this.failureCount++;
+            this.lastFailureTime = Date.now();
+            
+            if (this.failureCount >= this.config.failureThreshold) {
+                this.state = 'OPEN';
+            }
+            throw error;
+        }
+    }
+
+    getState(): string {
+        return this.state;
+    }
+}
+
+export class SqliteDatabaseAdapter implements IDatabaseAdapter {
     db: Database;
+    private circuitBreaker: CircuitBreaker;
 
     constructor(db: Database) {
-        super();
         this.db = db;
+        this.circuitBreaker = new CircuitBreaker({
+            failureThreshold: 5,
+            resetTimeout: 60000,
+            halfOpenMaxAttempts: 3
+        });
         load(db);
+    }
+
+    protected async withCircuitBreaker<T>(
+        operation: () => Promise<T>,
+        context: string
+    ): Promise<T> {
+        try {
+            return await this.circuitBreaker.execute(operation);
+        } catch (error) {
+            elizaLogger.error(`Circuit breaker error in ${context}:`, error);
+            throw error;
+        }
+    }
+
+    async updateMemory(memory: Memory, tableName: string): Promise<void> {
+        const sql = `UPDATE memories 
+            SET content = ?, 
+                embedding = ?,
+                updatedAt = CURRENT_TIMESTAMP 
+            WHERE id = ? AND type = ?`;
+        
+        this.db.prepare(sql).run(
+            JSON.stringify(memory.content),
+            memory.embedding ? new Float32Array(memory.embedding) : null,
+            memory.id,
+            tableName
+        );
     }
 
     async getRoom(roomId: UUID): Promise<UUID | null> {
@@ -260,8 +332,8 @@ export class SqliteDatabaseAdapter
         const content = JSON.stringify(memory.content);
         const createdAt = memory.createdAt ?? Date.now();
 
-        let embeddingValue: Float32Array = new Float32Array(384);
-        // If embedding is not available, we just load an array with a length of 384
+        let embeddingValue: Float32Array = new Float32Array(1536);
+        // If embedding is not available, we just load an array with a length of 1536
         if (memory?.embedding && memory?.embedding?.length > 0) {
             embeddingValue = new Float32Array(memory.embedding);
         }
@@ -1142,5 +1214,23 @@ export class SqliteDatabaseAdapter
             hasMore,
             nextCursor
         };
+    }
+
+    async beginTransaction(): Promise<void> {
+        this.db.prepare('BEGIN TRANSACTION').run();
+    }
+
+    async commitTransaction(): Promise<void> {
+        this.db.prepare('COMMIT').run();
+    }
+
+    async rollbackTransaction(): Promise<void> {
+        this.db.prepare('ROLLBACK').run();
+    }
+
+    async query(sql: string, params?: any[]): Promise<{ rows: any[] }> {
+        const stmt = this.db.prepare(sql);
+        const rows = params ? stmt.all(...params) : stmt.all();
+        return { rows };
     }
 }

@@ -24,6 +24,8 @@ export class MemoryManager implements IMemoryManager {
      */
     tableName: string;
 
+    protected memorySubscriptions: Map<string, Set<(memory: Memory) => Promise<void>>> = new Map();
+
     /**
      * Constructs a new MemoryManager instance.
      * @param opts Options for the manager.
@@ -44,22 +46,37 @@ export class MemoryManager implements IMemoryManager {
     }
 
     /**
-     * Adds an embedding vector to a memory object. If the memory already has an embedding, it is returned as is.
-     * @param memory The memory object to add an embedding to.
-     * @returns A Promise resolving to the memory object, potentially updated with an embedding vector.
-     */
-    /**
      * Adds an embedding vector to a memory object if one doesn't already exist.
      * The embedding is generated from the memory's text content using the runtime's
      * embedding model. If the memory has no text content, an error is thrown.
      *
      * @param memory The memory object to add an embedding to
      * @returns The memory object with an embedding vector added
-     * @throws Error if the memory content is empty
+     * @throws Error if the memory content is empty or if embedding generation fails
      */
     async addEmbeddingToMemory(memory: Memory): Promise<Memory> {
+        // Check if embeddings are globally disabled
+        const disableEmbeddings = process.env.DISABLE_EMBEDDINGS?.toLowerCase() === "true";
+        
+        // If embeddings are disabled, just add a zero vector and skip all other processing
+        if (disableEmbeddings) {
+            memory.embedding = getEmbeddingZeroVector();
+            return memory;
+        }
+        
         // Return early if embedding already exists
         if (memory.embedding) {
+            // Validate existing embedding - NOTE: Expected dimension is 384 for BGE embeddings
+            if (!Array.isArray(memory.embedding) || memory.embedding.length !== 384) {
+                elizaLogger.error("Invalid existing embedding:", {
+                    isArray: Array.isArray(memory.embedding),
+                    length: Array.isArray(memory.embedding) ? memory.embedding.length : 'not an array',
+                    expected: 384
+                });
+                // Use a zero vector instead of throwing
+                elizaLogger.warn("Replacing invalid embedding with zero vector");
+                memory.embedding = getEmbeddingZeroVector();
+            }
             return memory;
         }
 
@@ -67,18 +84,42 @@ export class MemoryManager implements IMemoryManager {
 
         // Validate memory has text content
         if (!memoryText) {
-            throw new Error(
-                "Cannot generate embedding: Memory content is empty"
-            );
+            elizaLogger.warn("Cannot generate embedding: Memory content is empty, using zero vector");
+            memory.embedding = getEmbeddingZeroVector();
+            return memory;
         }
 
         try {
             // Generate embedding from text content
-            memory.embedding = await embed(this.runtime, memoryText);
+            const embedding = await embed(this.runtime, memoryText);
+            
+            // Validate embedding
+            if (!Array.isArray(embedding) || embedding.length !== 1536) {
+                elizaLogger.error("Invalid generated embedding:", {
+                    isArray: Array.isArray(embedding),
+                    length: Array.isArray(embedding) ? embedding.length : 'not an array'
+                });
+                // Use a zero vector instead of throwing
+                elizaLogger.warn("Using zero vector due to invalid embedding format");
+                memory.embedding = getEmbeddingZeroVector();
+                return memory;
+            }
+            
+            memory.embedding = embedding;
         } catch (error) {
-            elizaLogger.error("Failed to generate embedding:", error);
-            // Fallback to zero vector if embedding fails
-            memory.embedding = getEmbeddingZeroVector().slice();
+            elizaLogger.error("Failed to generate embedding, using zero vector as fallback:", error);
+            // Use a zero vector instead of propagating the error
+            memory.embedding = getEmbeddingZeroVector();
+            
+            // Add a flag to indicate this is a fallback embedding
+            // Use memory.content for storing metadata since Memory doesn't have a top-level metadata field
+            const currentMetadata = memory.content.metadata || {};
+            
+            // Add embeddingFallback flag to content metadata (avoid using spread operator)
+            memory.content.metadata = Object.assign({}, currentMetadata, {
+                embeddingFallback: true,
+                embeddingError: error instanceof Error ? error.message : 'Unknown error'
+            });
         }
 
         return memory;
@@ -157,6 +198,46 @@ export class MemoryManager implements IMemoryManager {
             roomId,
             unique,
         } = opts;
+
+        // Check if embeddings are disabled
+        const disableEmbeddings = process.env.DISABLE_EMBEDDINGS?.toLowerCase() === "true";
+        
+        // If embeddings are disabled, just return recent memories instead of trying semantic search
+        if (disableEmbeddings) {
+            elizaLogger.debug("Embeddings disabled, skipping semantic search and returning recent memories");
+            
+            // Handle the case where roomId might be missing
+            let effectiveRoomId = roomId;
+            if (!effectiveRoomId) {
+                // Try to use a default room ID - first check for a global room constant
+                const globalRoomId = (global as any).__GLOBAL_ROOM_ID as UUID;
+                
+                if (globalRoomId) {
+                    effectiveRoomId = globalRoomId;
+                    elizaLogger.debug("Using global room ID as fallback for missing roomId");
+                } else {
+                    // Fall back to the agent's ID as the room ID
+                    effectiveRoomId = this.runtime.agentId;
+                    elizaLogger.debug("Using agent ID as fallback for missing roomId");
+                }
+                
+                elizaLogger.info("Using fallback roomId in searchMemoriesByEmbedding:", effectiveRoomId);
+            }
+            
+            // Use getMemories as a fallback
+            try {
+                return await this.runtime.databaseAdapter.getMemories({
+                    roomId: effectiveRoomId,
+                    count,
+                    unique: !!unique,
+                    tableName: this.tableName,
+                    agentId: this.runtime.agentId
+                });
+            } catch (error) {
+                elizaLogger.error("Error in fallback getMemories:", error);
+                return []; // Return empty array on error
+            }
+        }
 
         const result = await this.runtime.databaseAdapter.searchMemories({
             tableName: this.tableName,
@@ -317,6 +398,43 @@ export class MemoryManager implements IMemoryManager {
      * Retrieves a memory by its ID. Alias for getMemoryById.
      */
     async getMemory(id: UUID): Promise<Memory | null> {
+        return this.getMemoryById(id);
+    }
+
+    subscribeToMemory(type: string, callback: (memory: Memory) => Promise<void>): void {
+        if (!this.memorySubscriptions.has(type)) {
+            this.memorySubscriptions.set(type, new Set());
+        }
+        this.memorySubscriptions.get(type)?.add(callback);
+    }
+
+    unsubscribeFromMemory(type: string, callback: (memory: Memory) => Promise<void>): void {
+        this.memorySubscriptions.get(type)?.delete(callback);
+    }
+
+    async updateMemory(memory: Memory): Promise<void> {
+        await this.runtime.databaseAdapter.updateMemory(memory, this.tableName);
+    }
+
+    async updateMemoryWithVersion(id: UUID, update: Partial<Memory>, expectedVersion: number): Promise<boolean> {
+        const current = await this.getMemoryById(id);
+        if (!current || !current.content || current.content.version !== expectedVersion) {
+            return false;
+        }
+        await this.updateMemory({
+            ...current,
+            ...update,
+            content: {
+                ...current.content,
+                ...update.content,
+                version: expectedVersion + 1,
+                versionTimestamp: Date.now()
+            }
+        });
+        return true;
+    }
+
+    async getLatestVersionWithLock(id: UUID): Promise<Memory | null> {
         return this.getMemoryById(id);
     }
 }

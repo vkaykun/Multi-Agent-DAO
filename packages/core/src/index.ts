@@ -26,6 +26,7 @@ export * from "./ragknowledge.ts";
 export * from "./utils.ts";
 
 // Re-export types, excluding CacheStore which comes from cache.ts
+export type { IDatabaseCacheAdapter } from "./database.ts";
 export * from "./types.ts";
 
 // Re-export cache

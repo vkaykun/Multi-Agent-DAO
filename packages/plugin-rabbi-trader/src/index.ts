@@ -1,8 +1,7 @@
 import type { Plugin, IAgentRuntime, Memory, State } from "@elizaos/core";
 import { elizaLogger, settings } from "@elizaos/core";
 import { TwitterClientInterface } from "@elizaos/client-twitter";
-import {
-    solanaPlugin,
+import solanaPlugin, {
     getTokenBalance,
 } from "@elizaos/plugin-solana";
 import { TokenProvider } from "./providers/token";
@@ -61,10 +60,10 @@ const REQUIRED_SETTINGS = {
 interface ExtendedPlugin extends Plugin {
     name: string;
     description: string;
-    evaluators: any[];
-    providers: any[];
-    actions: any[];
-    services: any[];
+    evaluators?: any[];
+    providers?: any[];
+    actions?: any[];
+    services?: any[];
     autoStart?: boolean;
 }
 

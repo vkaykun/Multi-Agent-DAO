@@ -1,47 +1,52 @@
+// shared/types/memory.ts
+
 import { UUID, Media, Content, stringToUuid, Memory as CoreMemory } from "@elizaos/core";
-import { BaseContent, ContentStatus } from './base';
+import { BaseContent, ContentStatus } from './base.ts';
 
 // Define global room IDs as UUID patterns
-export const GLOBAL_ROOM_ID = "global-0000-0000-0000-000000000000" as UUID;
-export const PROPOSAL_ROOM_ID = "proposal-0000-0000-0000-000000000000" as UUID;
-export const TREASURY_ROOM_ID = "treasury-0000-0000-0000-000000000000" as UUID;
-export const STRATEGY_ROOM_ID = "strategy-0000-0000-0000-000000000000" as UUID;
+export const GLOBAL_ROOM_ID = "00000000-0000-0000-0000-000000000001" as UUID;
+export const PROPOSAL_ROOM_ID = "00000000-0000-0000-0000-000000000002" as UUID;
+export const TREASURY_ROOM_ID = "00000000-0000-0000-0000-000000000003" as UUID;
+export const STRATEGY_ROOM_ID = "00000000-0000-0000-0000-000000000004" as UUID;
 
 export type DAOMemoryType = 
     // Proposal related
     | "proposal"
     | "proposal_created"
-    | "proposal_passed"
-    | "proposal_rejected"
-    | "proposal_executed"
     | "proposal_status_changed"
-    | "vote_cast"
+    | "proposal_execution_result"
+    | "proposal_passed" // Backward compatibility
+    | "proposal_executed" // Backward compatibility
+    | "vote_cast"  // Single event for votes - agents track status in metadata
     | "close_vote_request"
-    | "vote_recorded"
     
     // Strategy related
     | "strategy"
     | "strategy_created"
-    | "strategy_triggered"
-    | "strategy_execution"
-    | "strategy_execution_request"
-    | "strategy_execution_result"
-    | "strategy_status_changed"
-    | "strategy_cancellation"
-    | "strategy_passed"
-    | "strategy_rejected"
-    | "strategy_executed"
+    | "strategy_execution_request"  // Initial request to execute
+    | "strategy_status_changed"     // Status updates (triggered, executing, etc)
+    | "strategy_execution_result"   // Final result of execution
     
     // Treasury related
     | "swap_request"
-    | "swap_completed"
-    | "swap_failed"
+    | "swap_execution_result"  // Unified result type (includes success/failure)
+    | "swap_completed"  // Backward compatibility
     | "deposit"
     | "deposit_received"
     | "transfer"
     | "transfer_requested"
     | "registration"
     | "wallet_registration"
+    | "deposit_response"
+    | "register_response"
+    | "verify_response"
+    | "transfer_response"
+    | "balance_response"
+    | "pending_deposit"
+    | "deposit_verified"
+    | "deposit_instructions"
+    | "treasury_transaction"
+    | "wallet_registration_result"
     
     // Position/Market related
     | "position_update"
@@ -50,8 +55,24 @@ export type DAOMemoryType =
     // System related
     | "broadcast"
     | "memory_error"
+    | "transaction" // Backward compatibility
     | "transaction_completed"
-    | "pending_transaction";
+    | "pending_transaction"
+    | "transaction_status_changed"
+
+    // Nova-specific memory types
+    | "user_interaction"
+    | "user_preference_update"
+    | "user_feedback"
+    | "learning_update"
+    | "conversation_context"
+    | "task_tracking"
+    | "user_profile_update"
+    
+    // Generic conversation types - critical for context maintenance
+    | "message"  
+    | "user_message"
+    | "agent_response";
 
 export interface DAOMemoryContent extends BaseContent {
     type: DAOMemoryType;
@@ -221,4 +242,66 @@ export interface MemoryMetadata {
     error?: string;
     errorDetails?: Record<string, unknown>;
     [key: string]: unknown;  // Add index signature
+}
+
+// Nova-specific interfaces
+export interface UserInteractionContent extends BaseContent {
+    type: "user_interaction";
+    interactionType: "command" | "question" | "feedback" | "action";
+    context?: {
+        topic?: string;
+        intent?: string;
+        entities?: string[];
+    };
+}
+
+export interface UserPreferenceContent extends BaseContent {
+    type: "user_preference_update";
+    preferences: {
+        [key: string]: any;
+    };
+    updatedBy: string;
+}
+
+export interface UserFeedbackContent extends BaseContent {
+    type: "user_feedback";
+    rating?: number;
+    category: string;
+    sentiment?: "positive" | "negative" | "neutral";
+}
+
+export interface LearningUpdateContent extends BaseContent {
+    type: "learning_update";
+    learningType: "preference" | "behavior" | "knowledge";
+    modelUpdates: {
+        [key: string]: any;
+    };
+}
+
+export interface ConversationContextContent extends BaseContent {
+    type: "conversation_context";
+    context: {
+        topic: string;
+        intent?: string;
+        entities?: string[];
+        relevantTopics?: string[];
+        sentiment?: string;
+    };
+}
+
+export interface TaskTrackingContent extends BaseContent {
+    type: "task_tracking";
+    taskId: string;
+    taskState: "pending" | "in_progress" | "completed" | "failed";
+    status: ContentStatus;
+    progress?: number;
+    dependencies?: string[];
+}
+
+export interface UserProfileUpdateContent extends BaseContent {
+    type: "user_profile_update";
+    updates: {
+        [key: string]: any;
+    };
+    updatedFields: string[];
 } 

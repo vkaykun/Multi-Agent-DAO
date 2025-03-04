@@ -1,6 +1,6 @@
 import { IAgentRuntime, UUID } from "@elizaos/core";
-import { StrategyContent } from "../types/strategy";
-import { findUniversalContent, queryUniversalContent } from "./search";
+import { StrategyContent } from "../types/strategy.ts";
+import { findUniversalContent, queryUniversalContent } from "./search.ts";
 
 export async function findStrategy(
     runtime: IAgentRuntime,

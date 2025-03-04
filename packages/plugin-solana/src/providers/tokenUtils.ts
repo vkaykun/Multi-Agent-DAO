@@ -3,7 +3,7 @@
 import { getAccount, getAssociatedTokenAddress } from "@solana/spl-token";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { elizaLogger } from "@elizaos/core";
-import { ENDPOINTS } from "../endpoints.js";
+import { ENDPOINTS } from "../endpoints.ts";
 
 interface DexScreenerResponse {
     pairs?: Array<{

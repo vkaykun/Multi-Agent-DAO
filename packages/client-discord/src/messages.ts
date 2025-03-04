@@ -1,4 +1,4 @@
-// packages/client-discord/src/messages.ts
+// packages/client-discord/src/messages.ts 
 
 import { composeContext, composeRandomUser } from "@elizaos/core";
 import { generateMessageResponse, generateShouldRespond } from "@elizaos/core";
@@ -26,6 +26,7 @@ import {
     TextChannel,
     MessageReaction,
     User,
+    MessageFlags
 } from "discord.js";
 import { AttachmentManager } from "./attachments";
 import { VoiceManager } from "./voice";
@@ -47,14 +48,10 @@ import {
     canSendMessage,
     cosineSimilarity,
 } from "./utils";
-import { solanaPlugin } from "@elizaos/plugin-solana";
+import { AgentType, BaseAgent, ProposalAgent, IAgentRuntime as SolanaAgentRuntime, createSolanaRuntime } from "@elizaos/plugin-solana";
 
-// Get functions from the plugin's vote action and constants
-const voteAction = solanaPlugin.actions.find(a => a.name === "vote") as any;
-const { processVote, handleReaction: handleVoteReaction } = voteAction;
-
-// Define the global DAO room ID
-const DAO_ROOM_ID = "dao-global-room-0000-0000-0000-000000000000" as UUID;
+// Use the same UUID format as in constants.ts
+const DAO_ROOM_ID = "00000000-0000-0000-0000-000000000001" as UUID;
 
 interface MessageContext {
     content: string;
@@ -71,20 +68,234 @@ export type InterestChannels = {
     };
 };
 
+// Add Discord client configuration interface
+interface DiscordClientConfig {
+    shouldIgnoreBotMessages?: boolean;
+    shouldIgnoreDirectMessages?: boolean;
+    shouldRespondOnlyToMentions?: boolean;
+    messageSimilarityThreshold?: number;
+    isPartOfTeam?: boolean;
+    teamAgentIds?: string[];
+    teamLeaderId?: string;
+    teamMemberInterestKeywords?: string[];
+    allowedChannelIds?: string[];
+    autoPost?: any;
+    disableProposalAgent?: boolean;
+}
+
 export class MessageManager {
     private client: Client;
-    private runtime: IAgentRuntime;
+    private runtime: SolanaAgentRuntime;
     private attachmentManager: AttachmentManager;
     private interestChannels: InterestChannels = {};
-    private discordClient: any;
+    private _discordClient: any;
     private voiceManager: VoiceManager;
+    private proposalAgent: ProposalAgent;
 
     constructor(discordClient: any, voiceManager: VoiceManager) {
         this.client = discordClient.client;
         this.voiceManager = voiceManager;
-        this.discordClient = discordClient;
-        this.runtime = discordClient.runtime;
+        this._discordClient = discordClient;
+        this.runtime = discordClient.runtime as SolanaAgentRuntime;
         this.attachmentManager = new AttachmentManager(this.runtime);
+        
+        // Log that we're setting up the message broker listener
+        elizaLogger.info("Setting up messageBroker listener for register_response events", {
+            agentType: this.runtime.agentType,
+            // Use type assertion for messageBroker access
+            hasMessageBroker: !!(this.runtime as any).messageBroker
+        });
+        
+        // ADD LISTENER FOR REGISTER_RESPONSE MESSAGES - BEFORE early return to ensure it's always registered
+        // @ts-ignore - messageBroker exists on the runtime but may not be in the type definition
+        (this.runtime as any).messageBroker?.on("register_response", async (payload: any) => {
+            // Log that we received an event
+            elizaLogger.info("👋 RECEIVED register_response EVENT in Discord client", { 
+                payloadType: payload?.type,
+                hasContent: !!payload?.content,
+                contentStructure: payload?.content ? {
+                    hasText: typeof payload.content.text === 'string',
+                    hasChannelId: !!payload.content.channelId,
+                    channelId: payload.content.channelId,
+                    metadataChannelId: payload.content.metadata?.originalChannelId
+                } : 'missing'
+            });
+            
+            // Extract content from the register_response payload
+            const { content } = payload;
+            if (!content || typeof content.text !== "string") {
+                elizaLogger.warn("Invalid register_response payload", { 
+                    payload,
+                    reason: !content ? 'missing content' : 'missing text field'
+                });
+                return;
+            }
+            
+            elizaLogger.info("Processing register_response message", { 
+                responseText: content.text?.substring(0, 100),
+                metadata: content.metadata,
+                channelId: content.channelId,
+                metadataChannelId: content.metadata?.originalChannelId
+            });
+            
+            // Determine which channel to send the response to
+            // First try getting the original channel ID from message metadata
+            let channelId = content.metadata?.originalChannelId || content.channelId;
+            
+            // If no specific channel is provided, try to find a suitable one
+            if (!channelId) {
+                elizaLogger.info("No channel ID provided, searching for available channels");
+                // Get the first available text channel from any guild
+                const guilds = this.client.guilds.cache;
+                for (const [, guild] of guilds) {
+                    const textChannels = guild.channels.cache.filter(
+                        (channel: any) => channel.type === ChannelType.GuildText && canSendMessage(channel)
+                    );
+                    if (textChannels.size > 0) {
+                        channelId = textChannels.first().id;
+                        elizaLogger.info("Found suitable channel", { channelId, guildId: guild.id });
+                        break;
+                    }
+                }
+            }
+            
+            // If we found a channel, send the message
+            if (channelId) {
+                elizaLogger.info("Attempting to send to channel", { channelId });
+                const channel = this.client.channels.cache.get(channelId);
+                if (channel?.isTextBased()) {
+                    try {
+                        // Handle different channel types - sendMessageInChunks expects TextChannel
+                        if (channel.type === ChannelType.GuildText) {
+                            elizaLogger.info("Sending to GuildText channel", { 
+                                channelType: channel.type,
+                                text: content.text.substring(0, 100)
+                            });
+                            await sendMessageInChunks(channel as TextChannel, content.text, undefined, []);
+                        } else {
+                            elizaLogger.info("Sending to non-GuildText channel", { 
+                                channelType: channel.type,
+                                text: content.text.substring(0, 100)
+                            });
+                            // For other channel types that support sending messages
+                            // @ts-ignore - Not all channel types have the same methods, but we've checked isTextBased()
+                            await channel.send(content.text);
+                        }
+                        elizaLogger.info("Successfully sent register_response to Discord channel", { channelId });
+                    } catch (error) {
+                        elizaLogger.error("Error sending register_response to Discord channel", { 
+                            error: error instanceof Error ? error.message : String(error),
+                            stack: error instanceof Error ? error.stack : undefined,
+                            channelId,
+                            text: content.text.substring(0, 100)
+                        });
+                    }
+                } else {
+                    elizaLogger.warn("Cannot send register_response: Channel not found or not text-based", { 
+                        channelId,
+                        channelExists: !!channel,
+                        channelType: channel ? channel.type : 'unknown'
+                    });
+                }
+            } else {
+                elizaLogger.warn("Cannot send register_response: No suitable channel found");
+            }
+        });
+        
+        // IMPORTANT: Don't return early for Treasury agents - we just don't initialize ProposalAgent
+        if (this.runtime.agentType === "TREASURY") {
+            elizaLogger.info("Initializing DiscordMessages for Treasury agent, continuing with listener setup");
+            // No early return - allow code to continue
+        } 
+        // Initialize ProposalAgent only if explicitly needed
+        else if (this.runtime.agentType === "PROPOSAL") {
+            // Initialize ProposalAgent with Solana runtime
+            createSolanaRuntime({
+                ...this.runtime,
+                agentId: stringToUuid("proposal"),
+                agentType: "PROPOSAL" as const,
+                character: {
+                    ...this.runtime.character,
+                    agentConfig: {
+                        type: "PROPOSAL" as const,
+                        capabilities: [],
+                        permissions: [],
+                        settings: {
+                            ...this.runtime.character.agentConfig?.settings,
+                            PROPOSAL_QUORUM: process.env.PROPOSAL_QUORUM,
+                            PROPOSAL_MINIMUM_YES_VOTES: process.env.PROPOSAL_MINIMUM_YES_VOTES,
+                            PROPOSAL_MINIMUM_VOTE_PERCENTAGE: process.env.PROPOSAL_MINIMUM_VOTE_PERCENTAGE
+                        }
+                    }
+                },
+                messageManager: this.runtime.messageManager,
+                documentsManager: this.runtime.documentsManager,
+                knowledgeManager: this.runtime.knowledgeManager
+            }).then(solanaRuntime => {
+                this.proposalAgent = new ProposalAgent(solanaRuntime);
+                return this.proposalAgent.initialize();
+            }).catch(error => {
+                elizaLogger.error("Failed to initialize ProposalAgent:", error);
+            });
+        }
+
+        // Set up a listener for direct registration responses as a backup mechanism
+        elizaLogger.info("Setting up messageBroker listener for register_response events", {
+            agentType: this.runtime.agentType,
+            // Use type assertion for messageBroker access
+            hasMessageBroker: !!(this.runtime as any).messageBroker
+        });
+        
+        // Use type assertion for messageBroker access
+        (this.runtime as any).messageBroker?.on("register_response", async (data: any) => {
+            try {
+                elizaLogger.info("Received register_response event through message broker", {
+                    data: typeof data === 'object' ? JSON.stringify(data).substring(0, 100) : String(data).substring(0, 100)
+                });
+                
+                // If we have information about the channel and message to respond to
+                if (data.channelId && data.messageId) {
+                    const channel = this._discordClient?.channels.cache.get(data.channelId) as TextChannel;
+                    if (channel) {
+                        try {
+                            const discordMessages = await sendMessageInChunks(
+                                channel,
+                                data.message || "Your wallet registration has been processed.",
+                                data.messageId,
+                                []
+                            );
+                            
+                            elizaLogger.info("Successfully sent event-based wallet registration response", {
+                                channelId: data.channelId,
+                                messageCount: discordMessages.length
+                            });
+                        } catch (error) {
+                            elizaLogger.error("Error sending event-based registration response", {
+                                error: error instanceof Error ? error.message : String(error)
+                            });
+                        }
+                    } else {
+                        elizaLogger.warn("Could not find channel for register_response event", {
+                            channelId: data.channelId
+                        });
+                    }
+                } else {
+                    elizaLogger.warn("Missing channel/message info in register_response event", {
+                        data: typeof data === 'object' ? JSON.stringify(data).substring(0, 100) : String(data).substring(0, 100)
+                    });
+                }
+            } catch (error) {
+                elizaLogger.error("Error handling register_response event", {
+                    error: error instanceof Error ? error.message : String(error)
+                });
+            }
+        });
+        
+        // Treasury agent note - we still need to set up event listeners
+        if (this.runtime.agentType === "TREASURY") {
+            elizaLogger.info("Initializing DiscordMessages for Treasury agent, continuing with listener setup");
+            // No early return - allow all messaging code to run
+        }
     }
 
     async handleMessage(message: DiscordMessage) {
@@ -97,13 +308,24 @@ export class MessageManager {
             return;
         }
 
+        let wasHandledByAction = false;
+        let shouldRespond = false;
+
         // Get basic message info first
         const userId = message.author.id as UUID;
         const userName = message.author.username;
         const channelId = message.channel.id;
         // Always use global DAO room for Discord messages to ensure all agents can see them
         const roomId = DAO_ROOM_ID;
-        const userIdUUID = stringToUuid(userId);
+        // Format Discord user ID with prefix for consistent identification
+        const formattedDiscordId = `discord-${userId}`;
+        const userIdUUID = stringToUuid(formattedDiscordId);
+        elizaLogger.debug("Discord user ID conversion", {
+            originalId: userId,
+            prefixedId: formattedDiscordId,
+            generatedUUID: userIdUUID.toString(),
+            source: "handleMessage"
+        });
 
         // Ensure connection exists
         await this.runtime.ensureConnection(
@@ -117,6 +339,298 @@ export class MessageManager {
         const contentTrimmed = message.content.trim();
         const mentionRegex = new RegExp(`^<@${this.client.user?.id}>\\s*`);
         const contentWithoutMention = contentTrimmed.replace(mentionRegex, "").trim();
+        
+        // Check specifically for wallet registration patterns in Discord mentions
+        const walletRegistrationRegex = /@\w+\s+register|<@!?\d+>\s+register/i;
+        const isWalletRegistration = walletRegistrationRegex.test(contentTrimmed);
+        
+        // Extract wallet address if present (look for a pattern like a Solana address)
+        const solanaAddressPattern = /\b([1-9A-HJ-NP-Za-km-z]{32,44})\b/;
+        const walletMatch = contentTrimmed.match(solanaAddressPattern);
+        const hasWalletAddress = Boolean(walletMatch);
+        
+        // Handle special case for wallet registration
+        if (isWalletRegistration && hasWalletAddress) {
+            elizaLogger.info("Detected wallet registration command in Discord message", {
+                content: contentTrimmed,
+                walletAddress: walletMatch[0],
+                userId: message.author.id,
+                discordIdWithPrefix: formattedDiscordId
+            });
+            
+            // Create base memory content with explicit action for wallet registration
+            const content: Content = {
+                type: "user_message", // Explicitly set type to user_message, NOT wallet_registration
+                text: contentTrimmed,
+                action: "register", // Explicitly set the action to register
+                source: "discord",
+                url: message.url,
+                username: message.author.username,
+                displayName: message.author.displayName,
+                channelId: channelId, // Store the original channel ID
+                metadata: {
+                    originalChannelId: channelId, // Also store in metadata for easier access
+                    walletAddress: walletMatch[0], // Store the wallet address for easier processing
+                    rawDiscordId: message.author.id,
+                    prefixedDiscordId: formattedDiscordId
+                },
+                inReplyTo: message.reference?.messageId
+                    ? stringToUuid(message.reference.messageId + "-" + this.runtime.agentId)
+                    : undefined,
+            };
+            
+            // Create base memory with the action set
+            const messageId = stringToUuid(message.id + "-" + this.runtime.agentId);
+            const isWalletRegistrationMsg = 
+                (content.text || '').toLowerCase().includes("register wallet") ||
+                (content.text || '').toLowerCase().includes("!register") ||
+                (content.text || '').toLowerCase().includes("register my wallet");
+
+            const memory: Memory = {
+                id: messageId,
+                userId: userIdUUID,
+                agentId: this.runtime.agentId,
+                roomId,  // Using global room
+                content: {
+                    text: content.text || '',
+                    source: content.source || 'discord',
+                    url: content.url,
+                    username: content.username,
+                    displayName: content.displayName,
+                    channelId: content.channelId,
+                    type: isWalletRegistrationMsg ? "wallet_registration" : "user_message",
+                    createdAt: message.createdTimestamp,
+                    metadata: {
+                        originalChannelId: content.metadata?.originalChannelId as string,
+                        rawDiscordId: content.metadata?.rawDiscordId as string,
+                        prefixedDiscordId: content.metadata?.prefixedDiscordId as string,
+                        messageSource: "discord",
+                        isUserMessage: true,
+                        isWalletRegistration: isWalletRegistrationMsg
+                    }
+                },
+                createdAt: message.createdTimestamp
+            };
+            
+            // Store the message in memory
+            elizaLogger.info("Storing wallet registration memory as user_message type", { 
+                messageId,
+                contentType: content.type,
+                action: content.action 
+            });
+            await this.runtime.messageManager.createMemory(memory);
+            
+            // Add debug logging for wallet registration
+            if (isWalletRegistrationMsg) {
+                elizaLogger.info("Creating wallet registration memory", {
+                    messageId,
+                    userId: userIdUUID,
+                    type: "wallet_registration",
+                    text: content.text
+                });
+            }
+            
+            try {
+                // Process the message with the action system
+                elizaLogger.info("Processing registration with action system");
+                wasHandledByAction = true;
+                
+                // If the agent is a Treasury agent, handle the wallet registration directly
+                if (this.runtime.agentType === "TREASURY") {
+                    elizaLogger.info("Treasury agent handling registration directly");
+                    try {
+                        await this.runtime.processActions(memory, [memory], undefined, async (response) => {
+                            if (response) {
+                                elizaLogger.info("Direct registration response received from Treasury agent", { 
+                                    response: response.text?.substring(0, 100),
+                                    responseType: response.type,
+                                    responseHasChannelId: !!response.channelId,
+                                    responseMetadata: JSON.stringify(response.metadata || {}).substring(0, 200)
+                                });
+                                
+                                // Force sending the response via the standard message flow
+                                try {
+                                    // Make absolutely sure we have text to send
+                                    const textToSend = response.text || "Your wallet registration request has been processed.";
+                                    
+                                    elizaLogger.info("Attempting to send response via sendMessageInChunks", {
+                                        channel: message.channel.id,
+                                        messageId: message.id,
+                                        textLength: textToSend.length
+                                    });
+                                    
+                                    const discordMessages = await sendMessageInChunks(
+                                        message.channel as TextChannel,
+                                        textToSend,
+                                        message.id,
+                                        []
+                                    );
+                                    
+                                    elizaLogger.info("Successfully sent wallet registration response via sendMessageInChunks", {
+                                        channelId: message.channel.id,
+                                        responseText: textToSend.substring(0, 100),
+                                        numMessages: discordMessages.length
+                                    });
+                                    
+                                    // Store the response in memory too
+                                    for (const m of discordMessages) {
+                                        const responseMemory: Memory = {
+                                            id: stringToUuid(m.id + "-" + this.runtime.agentId),
+                                            userId: this.runtime.agentId,
+                                            agentId: this.runtime.agentId,
+                                            roomId: roomId,
+                                            content: {
+                                                text: m.content,
+                                                source: "discord",
+                                                action: "register_response"
+                                            },
+                                            createdAt: m.createdTimestamp
+                                        };
+                                        await this.runtime.messageManager.createMemory(responseMemory);
+                                    }
+                                } catch (error) {
+                                    elizaLogger.error("Error sending direct wallet registration response", {
+                                        error: error instanceof Error ? error.message : String(error),
+                                        stack: error instanceof Error ? error.stack : undefined,
+                                        channel: message.channel.id
+                                    });
+                                    
+                                    // Desperate fallback - try one more method if everything else failed
+                                    try {
+                                        await message.reply(response.text || "Your wallet registration has been processed.");
+                                        elizaLogger.info("Sent fallback registration response via message.reply");
+                                    } catch (replyError) {
+                                        elizaLogger.error("Failed even with fallback reply method", {
+                                            error: replyError instanceof Error ? replyError.message : String(replyError)
+                                        });
+                                    }
+                                }
+                            } else {
+                                elizaLogger.warn("No response received from Treasury agent registration action");
+                                // Send a fallback response
+                                try {
+                                    await message.reply("Your wallet registration request was processed, but no direct response was received. Please try again if you encounter issues.");
+                                    elizaLogger.info("Sent fallback message for empty registration response");
+                                } catch (error) {
+                                    elizaLogger.error("Failed to send fallback registration response", {
+                                        error: error instanceof Error ? error.message : String(error)
+                                    });
+                                }
+                            }
+                            return [];
+                        });
+                    } catch (error) {
+                        elizaLogger.error("Error in Treasury wallet registration flow:", {
+                            error: error instanceof Error ? error.message : String(error),
+                            stack: error instanceof Error ? error.stack : undefined
+                        });
+                        
+                        // Last resort fallback
+                        try {
+                            await message.reply("I encountered an error processing your wallet registration. Please try again or contact support.");
+                        } catch (replyError) {
+                            elizaLogger.error("Failed to send error response", {
+                                error: replyError instanceof Error ? replyError.message : String(replyError)
+                            });
+                        }
+                    }
+                } else {
+                    // Otherwise go through the processActions mechanism
+                    try {
+                        await this.runtime.processActions(memory, [memory], undefined, async (response) => {
+                            if (response) {
+                                elizaLogger.info("Registration response received from agent", { 
+                                    response: response.text?.substring(0, 100) 
+                                });
+                                
+                                // Use the same direct approach for consistency
+                                try {
+                                    // Force sending the response via the standard message flow
+                                    const discordMessages = await sendMessageInChunks(
+                                        message.channel as TextChannel,
+                                        response.text,
+                                        message.id,
+                                        []
+                                    );
+                                    
+                                    elizaLogger.info("Successfully sent wallet registration response via sendMessageInChunks", {
+                                        channelId: message.channel.id,
+                                        responseText: response.text?.substring(0, 100),
+                                        numMessages: discordMessages.length
+                                    });
+                                    
+                                    // Store the response in memory too
+                                    for (const m of discordMessages) {
+                                        const responseMemory: Memory = {
+                                            id: stringToUuid(m.id + "-" + this.runtime.agentId),
+                                            userId: this.runtime.agentId,
+                                            agentId: this.runtime.agentId,
+                                            roomId: roomId,
+                                            content: {
+                                                text: m.content,
+                                                source: "discord",
+                                                action: "register_response"
+                                            },
+                                            createdAt: m.createdTimestamp
+                                        };
+                                        await this.runtime.messageManager.createMemory(responseMemory);
+                                    }
+                                } catch (error) {
+                                    elizaLogger.error("Error sending direct wallet registration response", {
+                                        error: error instanceof Error ? error.message : String(error),
+                                        stack: error instanceof Error ? error.stack : undefined,
+                                        channel: message.channel.id
+                                    });
+                                    
+                                    // Desperate fallback - try one more method if everything else failed
+                                    try {
+                                        await message.reply(response.text);
+                                        elizaLogger.info("Sent fallback registration response via message.reply");
+                                    } catch (replyError) {
+                                        elizaLogger.error("Failed even with fallback reply method", {
+                                            error: replyError instanceof Error ? replyError.message : String(replyError)
+                                        });
+                                    }
+                                }
+                            } else {
+                                elizaLogger.warn("No response received from registration action");
+                                // Send a fallback response
+                                try {
+                                    await message.reply("Your wallet registration request was processed, but no direct response was received. Please try again if you encounter issues.");
+                                    elizaLogger.info("Sent fallback message for empty registration response");
+                                } catch (error) {
+                                    elizaLogger.error("Failed to send fallback registration response", {
+                                        error: error instanceof Error ? error.message : String(error)
+                                    });
+                                }
+                            }
+                            return [];
+                        });
+                    } catch (error) {
+                        elizaLogger.error("Error in wallet registration flow:", {
+                            error: error instanceof Error ? error.message : String(error),
+                            stack: error instanceof Error ? error.stack : undefined
+                        });
+                        
+                        // Last resort fallback
+                        try {
+                            await message.reply("I encountered an error processing your wallet registration. Please try again or contact support.");
+                        } catch (replyError) {
+                            elizaLogger.error("Failed to send error response", {
+                                error: replyError instanceof Error ? replyError.message : String(replyError)
+                            });
+                        }
+                    }
+                }
+            } catch (error) {
+                elizaLogger.error("Error processing wallet registration:", {
+                    error: error instanceof Error ? error.message : String(error),
+                    stack: error instanceof Error ? error.stack : undefined
+                });
+            }
+            
+            return;
+        }
 
         // Create base memory content
         const content: Content = {
@@ -126,6 +640,11 @@ export class MessageManager {
             username: message.author.username,
             displayName: message.author.displayName,
             channelId: channelId, // Store original channel ID for reference
+            metadata: {
+                originalChannelId: channelId,
+                rawDiscordId: message.author.id,
+                prefixedDiscordId: formattedDiscordId
+            },
             inReplyTo: message.reference?.messageId
                 ? stringToUuid(message.reference.messageId + "-" + this.runtime.agentId)
                 : undefined,
@@ -133,14 +652,58 @@ export class MessageManager {
 
         // Create base memory
         const messageId = stringToUuid(message.id + "-" + this.runtime.agentId);
+        const isWalletRegistrationMsg = 
+            (content.text || '').toLowerCase().includes("register wallet") ||
+            (content.text || '').toLowerCase().includes("!register") ||
+            (content.text || '').toLowerCase().includes("register my wallet");
+
         const memory: Memory = {
             id: messageId,
             userId: userIdUUID,
             agentId: this.runtime.agentId,
             roomId,  // Using global room
-            content,
-            createdAt: message.createdTimestamp,
+            content: {
+                text: content.text || '',
+                source: content.source || 'discord',
+                url: content.url,
+                username: content.username,
+                displayName: content.displayName,
+                channelId: content.channelId,
+                type: isWalletRegistrationMsg ? "wallet_registration" : "user_message",
+                createdAt: message.createdTimestamp,
+                metadata: {
+                    originalChannelId: content.metadata?.originalChannelId as string,
+                    rawDiscordId: content.metadata?.rawDiscordId as string,
+                    prefixedDiscordId: content.metadata?.prefixedDiscordId as string,
+                    messageSource: "discord",
+                    isUserMessage: true,
+                    isWalletRegistration: isWalletRegistrationMsg
+                }
+            },
+            createdAt: message.createdTimestamp
         };
+
+        // Debug log available actions
+        elizaLogger.debug("Available actions:", {
+            hasActions: !!(this.runtime as any).actions?.length,
+            actionCount: (this.runtime as any).actions?.length,
+            actionTypes: (this.runtime as any).actions?.map((a: any) => a.type || a.name)
+        });
+
+        // Ensure we track messages in this channel
+        if (!this.interestChannels[channelId]) {
+            this.interestChannels[channelId] = {
+                currentHandler: undefined,
+                lastMessageSent: Date.now(),
+                messages: []
+            };
+        }
+        this.interestChannels[channelId].messages.push({
+            userId: userIdUUID,
+            userName,
+            content
+        });
+        this.interestChannels[channelId].lastMessageSent = Date.now();
 
         // Handle commands first - with early return
         if (contentWithoutMention.startsWith('!')) {
@@ -154,7 +717,12 @@ export class MessageManager {
                 roomId,
                 content: {
                     ...content,
-                    action: commandName
+                    action: commandName,
+                    metadata: {
+                        originalChannelId: channelId,
+                        rawDiscordId: message.author.id,
+                        prefixedDiscordId: formattedDiscordId
+                    }
                 }
             };
 
@@ -235,9 +803,6 @@ export class MessageManager {
         );
 
         if (processedContent && !processedContent.startsWith('!')) {
-            let shouldRespond = false;
-            let wasHandledByAction = false;
-
             // Try natural language actions first
             const actionMemory: Memory = {
                 id: stringToUuid(`${message.id}-action`),
@@ -246,7 +811,11 @@ export class MessageManager {
                 roomId,
                 content: {
                     text: processedContent,
-                    source: "discord"
+                    source: "discord",
+                    metadata: {
+                        agentSource: true,
+                        agentId: this.runtime.agentId
+                    }
                 }
             };
 
@@ -327,9 +896,13 @@ export class MessageManager {
                             responseContent.text = responseContent.text.trim();
                             responseContent.inReplyTo = messageId;
 
+                            // Always send through processActions for complete Eliza flow
+                            const responseMemories = await this._sendResponse(message, responseContent, roomId, messageId);
+                            
+                            // Call processActions even if no action, to ensure proper framework flow
                             await this.runtime.processActions(
                                 memory,
-                                [],
+                                responseMemories,
                                 state,
                                 async (content: Content) => {
                                     return this._sendResponse(message, content, roomId, messageId);
@@ -344,11 +917,7 @@ export class MessageManager {
             }
         }
 
-        // Track if any action handled the message
-        const wasHandledByAction = false;
-        const shouldRespond = false;
-
-        // Finally, run evaluations
+        // Finally, run evaluations with the correct values
         await this.runtime.evaluate(memory, state, wasHandledByAction || shouldRespond);
     }
 
@@ -623,7 +1192,7 @@ export class MessageManager {
         // Calculate content similarity
         const similarity = cosineSimilarity(
             currentMessage.toLowerCase(),
-            previousContext.content.toLowerCase(),
+            previousContext.content.text.toLowerCase(),
             agentLastMessage?.toLowerCase()
         );
 
@@ -753,163 +1322,12 @@ export class MessageManager {
         return true;
     }
 
-    private async _shouldIgnore(message: DiscordMessage): Promise<boolean> {
-        // if the message is from us, ignore
-        if (message.author.id === this.client.user?.id) return true;
+    private _shouldIgnore(message: DiscordMessage): boolean {
+        if (!message.content) return true;
 
-        // Honor mentions-only mode
-        if (
-            this.runtime.character.clientConfig?.discord
-                ?.shouldRespondOnlyToMentions
-        ) {
-            return !this._isMessageForMe(message);
-        }
-
-        // Team-based ignore logic
-        if (this.runtime.character.clientConfig?.discord?.isPartOfTeam) {
-            const authorId = this._getNormalizedUserId(message.author.id);
-
-            if (this._isTeamLeader()) {
-                if (this._isTeamCoordinationRequest(message.content)) {
-                    return false;
-                }
-                // Ignore if message is only about team member interests and not directed to leader
-                if (!this._isMessageForMe(message)) {
-                    const otherMemberInterests =
-                        this.runtime.character.clientConfig?.discord
-                            ?.teamMemberInterestKeywords || [];
-                    const hasOtherInterests = otherMemberInterests.some(
-                        (keyword) =>
-                            message.content
-                                .toLowerCase()
-                                .includes(keyword.toLowerCase())
-                    );
-                    if (hasOtherInterests) {
-                        return true;
-                    }
-                }
-            } else if (this._isTeamCoordinationRequest(message.content)) {
-                const randomDelay =
-                    Math.floor(
-                        Math.random() *
-                            (TIMING_CONSTANTS.TEAM_MEMBER_DELAY_MAX -
-                                TIMING_CONSTANTS.TEAM_MEMBER_DELAY_MIN)
-                    ) + TIMING_CONSTANTS.TEAM_MEMBER_DELAY_MIN; // 1-3 second random delay
-                await new Promise((resolve) =>
-                    setTimeout(resolve, randomDelay)
-                );
-                return false;
-            }
-
-            if (this._isTeamMember(authorId)) {
-                if (!this._isMessageForMe(message)) {
-                    // If message contains our interests, don't ignore
-                    if (
-                        this._isRelevantToTeamMember(
-                            message.content,
-                            message.channelId
-                        )
-                    ) {
-                        return false;
-                    }
-                    return true;
-                }
-            }
-
-            // Check if we're in an active conversation based on context
-            const channelState = this.interestChannels[message.channelId];
-
-            if (channelState?.currentHandler) {
-                // If we're the current handler, check context
-                if (channelState.currentHandler === this.client.user?.id) {
-                    //If it's our keywords, bypass context check
-                    if (
-                        this._isRelevantToTeamMember(
-                            message.content,
-                            message.channelId
-                        )
-                    ) {
-                        return false;
-                    }
-
-                    const shouldRespondContext =
-                        await this._shouldRespondBasedOnContext(
-                            message,
-                            channelState
-                        );
-
-                    // If context is different, ignore. If similar, don't ignore
-                    return !shouldRespondContext;
-                }
-
-                // If another team member is handling and we're not mentioned or coordinating
-                else if (
-                    !this._isMessageForMe(message) &&
-                    !this._isTeamCoordinationRequest(message.content)
-                ) {
-                    return true;
-                }
-            }
-        }
-
-        let messageContent = message.content.toLowerCase();
-
-        // Replace the bot's @ping with the character name
-        const botMention = `<@${this.client.user?.id}>`;
-        messageContent = messageContent.replace(
-            new RegExp(botMention, "gi"),
-            this.runtime.character.name.toLowerCase()
-        );
-
-        // Replace the bot's username with the character name
-        const botUsername = this.client.user?.username.toLowerCase();
-        messageContent = messageContent.replace(
-            new RegExp(`\\b${botUsername}\\b`, "g"),
-            this.runtime.character.name.toLowerCase()
-        );
-
-        // strip all special characters
-        messageContent = messageContent.replace(/[^a-zA-Z0-9\s]/g, "");
-
-        // short responses where eliza should stop talking and disengage unless mentioned again
-        if (
-            messageContent.length < MESSAGE_LENGTH_THRESHOLDS.LOSE_INTEREST &&
-            LOSE_INTEREST_WORDS.some((word) => messageContent.includes(word))
-        ) {
-            delete this.interestChannels[message.channelId];
-            return true;
-        }
-
-        // If we're not interested in the channel and it's a short message, ignore it
-        if (
-            messageContent.length < MESSAGE_LENGTH_THRESHOLDS.SHORT_MESSAGE &&
-            !this.interestChannels[message.channelId]
-        ) {
-            return true;
-        }
-
-        const targetedPhrases = [
-            this.runtime.character.name + " stop responding",
-            this.runtime.character.name + " stop talking",
-            this.runtime.character.name + " shut up",
-            this.runtime.character.name + " stfu",
-            "stop talking" + this.runtime.character.name,
-            this.runtime.character.name + " stop talking",
-            "shut up " + this.runtime.character.name,
-            this.runtime.character.name + " shut up",
-            "stfu " + this.runtime.character.name,
-            this.runtime.character.name + " stfu",
-            "chill" + this.runtime.character.name,
-            this.runtime.character.name + " chill",
-        ];
-
-        // lose interest if pinged and told to stop responding
-        if (targetedPhrases.some((phrase) => messageContent.includes(phrase))) {
-            delete this.interestChannels[message.channelId];
-            return true;
-        }
-
-        // if the message is short, ignore but maintain interest
+        const messageContent = message.content.trim();
+        
+        // Don't respond to very short messages in channels we're not interested in
         if (
             !this.interestChannels[message.channelId] &&
             messageContent.length < MESSAGE_LENGTH_THRESHOLDS.VERY_SHORT_MESSAGE
@@ -917,15 +1335,15 @@ export class MessageManager {
             return true;
         }
 
+        // Ignore messages that contain certain words and are short
         if (
-            message.content.length <
-                MESSAGE_LENGTH_THRESHOLDS.IGNORE_RESPONSE &&
+            message.content.length < MESSAGE_LENGTH_THRESHOLDS.IGNORE_RESPONSE &&
             IGNORE_RESPONSE_WORDS.some((word) =>
                 message.content.toLowerCase().includes(word)
-            )
-        ) {
+            ) {
             return true;
         }
+        
         return false;
     }
 
@@ -1153,31 +1571,71 @@ export class MessageManager {
     }
 
     private async _generateResponse(
-        message: Memory,
+        memory: Memory,
         state: State,
         context: string
     ): Promise<Content> {
-        const { userId, roomId } = message;
+        try {
+            elizaLogger.debug("Generating response with:", {
+                memoryId: memory.id,
+                context: context.substring(0, 100) + "...",
+                state: {
+                    hasMessages: Array.isArray(state.messages),
+                    hasLastMessage: !!state.lastMessage,
+                    roomId: state.roomId
+                }
+            });
 
-        const response = await generateMessageResponse({
-            runtime: this.runtime,
-            context,
-            modelClass: ModelClass.LARGE,
-        });
+            const response = await generateMessageResponse({
+                runtime: this.runtime,
+                context,
+                modelClass: ModelClass.LARGE,
+            });
 
-        if (!response) {
-            console.error("No response from generateMessageResponse");
-            return;
+            if (!response) {
+                elizaLogger.error("No response from generateMessageResponse");
+                return {
+                    text: "I apologize, but I'm having trouble generating a response right now.",
+                    source: "discord"
+                };
+            }
+
+            elizaLogger.debug("Generated response:", {
+                hasText: !!response.text,
+                hasAction: !!response.action,
+                source: response.source
+            });
+
+            // Just pass through the response with source
+            const responseContent: Content = {
+                ...response,
+                source: "discord"
+            };
+
+            await this.runtime.databaseAdapter.log({
+                body: { message: memory, context, response: responseContent },
+                userId: memory.userId,
+                roomId: memory.roomId,
+                type: "response",
+            });
+
+            return responseContent;
+        } catch (error) {
+            elizaLogger.error("Error in _generateResponse:", {
+                error: error instanceof Error ? {
+                    message: error.message,
+                    stack: error.stack,
+                    name: error.name
+                } : error,
+                memoryId: memory.id,
+                userId: memory.userId,
+                roomId: memory.roomId
+            });
+            return {
+                text: "I apologize, but I encountered an error while trying to respond.",
+                source: "discord"
+            };
         }
-
-        await this.runtime.databaseAdapter.log({
-            body: { message, context, response },
-            userId: userId,
-            roomId,
-            type: "response",
-        });
-
-        return response;
     }
 
     async fetchBotName(botToken: string) {
@@ -1227,51 +1685,62 @@ export class MessageManager {
 
     async handleReaction(reaction: MessageReaction, user: User, added: boolean) {
         try {
-            await handleVoteReaction(this.runtime, reaction, user, added);
+            // Skip if the user is a bot
+            if (user.bot) return;
+
+            // Only handle thumbs up/down reactions
+            const emoji = reaction.emoji.name;
+            if (!emoji || (emoji !== '👍' && emoji !== '👎')) return;
+
+            // Get the proposal shortId from the message
+            const message = reaction.message;
+            const shortIdMatch = message.content?.match(/#([a-zA-Z0-9]{6})/);
+            if (!shortIdMatch) return;
+
+            const shortId = shortIdMatch[1];
+            const isYesVote = emoji === '👍';
+
+            // Create vote content
+            const voteContent = {
+                type: "vote_cast",
+                id: stringToUuid(`vote-${shortId}-${user.id}-${Date.now()}`),
+                text: `Vote cast: ${isYesVote ? "yes" : "no"} for proposal ${shortId}`,
+                agentId: this.runtime.agentId,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                status: "pending_execution",
+                proposalId: shortId,
+                vote: isYesVote ? "yes" : "no",
+                metadata: {
+                    proposalId: shortId,
+                    vote: isYesVote ? "yes" : "no",
+                    votingPower: 1,
+                    timestamp: Date.now()
+                }
+            };
+
+            // Create a simplified MessageReaction object for the ProposalAgent
+            const simplifiedReaction = {
+                message: {
+                    id: message.id,
+                    reactions: {
+                        cache: {
+                            find: (predicate: (r: any) => boolean) => reaction
+                        }
+                    }
+                },
+                emoji: reaction.emoji
+            };
+
+            // Send vote event to the agent
+            await this.proposalAgent.handleReaction(
+                simplifiedReaction as any,
+                user,
+                added
+            );
+
         } catch (error) {
             elizaLogger.error("Error in MessageManager.handleReaction:", error);
         }
-    }
-}
-
-// Add reaction handler
-export async function handleReaction(reaction: MessageReaction, user: User, runtime: IAgentRuntime) {
-    // Skip if the user is a bot
-    if (user.bot) return;
-
-    // Only handle thumbs up/down reactions
-    const emoji = reaction.emoji.name;
-    if (!emoji || (emoji !== '👍' && emoji !== '👎')) return;
-
-    try {
-        // Get the proposal shortId from the message
-        const message = reaction.message;
-        const shortIdMatch = message.content.match(/#([a-zA-Z0-9]{6})/);
-        if (!shortIdMatch) return;
-
-        const shortId = shortIdMatch[1];
-        const isYesVote = emoji === '👍';
-
-        // Process the vote
-        const result = await processVote(runtime, user.id.toString(), shortId, isYesVote);
-
-        if (result.success) {
-            // Update the message with new vote counts
-            const updatedContent = message.content.replace(
-                /Current results:[\s\S]*$/m,
-                `Current results:\n👍 Yes: ${result.yesCount}\n👎 No: ${result.noCount}`
-            );
-            await message.edit(updatedContent);
-        } else {
-            // Send error as reply
-            if (message.channel instanceof TextChannel) {
-                await message.channel.send({
-                    content: `❌ ${result.error}`,
-                    reply: { messageReference: message.id }
-                });
-            }
-        }
-    } catch (error) {
-        elizaLogger.error("Error handling reaction vote:", error);
     }
 }

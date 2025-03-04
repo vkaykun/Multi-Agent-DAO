@@ -1,25 +1,203 @@
-import { Content, UUID, ServiceType as CoreServiceType, IMemoryManager as CoreMemoryManager, IAgentRuntime as CoreAgentRuntime } from "@elizaos/core";
-import { Memory } from "./memory-types";
-import { MemoryQueryOptions } from './memory';
-import { ProposalType } from "./proposal";
+// packages/plugin-solana/src/shared/types/base.ts
+
+import { 
+    Content, 
+    ServiceType as CoreServiceType, 
+    IMemoryManager as CoreMemoryManager, 
+    IAgentRuntime as CoreAgentRuntime,
+    Memory
+} from "@elizaos/core";
+
+// Use UUID type from core
+import { UUID } from "@elizaos/core";
+
+// Remove unused imports
+import { ProposalType } from "./proposal.ts";
+import { UserProfile } from "./user.ts";
+import { MEMORY_SUBSCRIPTIONS } from "./memory-subscriptions.ts";
 
 // Define our own memory manager interface with all required methods
+export interface TransactionManager {
+    beginTransaction(): Promise<void>;
+    commitTransaction(): Promise<void>;
+    rollbackTransaction(): Promise<void>;
+    isInTransaction(): boolean;
+    getTransactionLevel(): number;
+}
+
+// Add a type for transaction context
+export interface TransactionContext {
+    level: number;
+    startTime: number;
+    operations: string[];
+}
+
+// Define memory query options interface
+export interface ExtendedMemoryOptions {
+    roomId: UUID;
+    count?: number;
+    unique?: boolean;
+    start?: number;
+    end?: number;
+    filter?: Record<string, unknown>;
+    lastId?: UUID;
+    createdAfter?: number;
+    createdBefore?: number;
+    updatedAfter?: number;
+    updatedBefore?: number;
+}
+
+// Update memory manager interface to properly extend core interface
 export interface IMemoryManager extends CoreMemoryManager {
+    subscribeToMemory(type: string, callback: (memory: Memory) => Promise<void>): void;
+    unsubscribeFromMemory(type: string, callback: (memory: Memory) => Promise<void>): void;
+    
+    // Memory operations
+    createMemory(memory: Memory, unique?: boolean): Promise<void>;
+    updateMemory(memory: Memory): Promise<void>;
+    
+    // Backward compatibility aliases - marked as deprecated
+    /** @deprecated Use subscribeToMemory instead */
     on(type: string, callback: (memory: any) => Promise<void>): void;
+    /** @deprecated Use unsubscribeFromMemory instead */
     off(type: string, callback: (memory: any) => Promise<void>): void;
+    /** @deprecated Use broadcastMemoryChange instead */
     emit?(type: string, memory: any): void;
+    
+    // Transaction methods
+    isInTransaction(): boolean;
+    getTransactionLevel(): number;
+    beginTransaction(options?: any): Promise<void>;
+    commitTransaction(): Promise<void>;
+    rollbackTransaction(): Promise<void>;
+    
+    // Lock-based operations
+    getMemoriesWithLock(options: { roomId: UUID; count: number; filter?: Record<string, any>; }): Promise<Memory[]>;
+    getMemoryWithLock(id: UUID): Promise<Memory | null>;
+    removeMemoriesWhere(filter: { type: string; filter: Record<string, any>; }): Promise<void>;
+
+    // Additional methods
+    addEmbeddingToMemory(memory: Memory): Promise<Memory>;
+    getMemoriesWithPagination(options: any): Promise<{ items: Memory[]; hasMore: boolean; nextCursor?: UUID; }>;
+    getCachedEmbeddings(content: string): Promise<{ embedding: number[]; levenshtein_score: number; }[]>;
+    searchMemoriesByEmbedding(embedding: number[], options: any): Promise<Memory[]>;
+    
+    // Lifecycle methods
+    initialize(): Promise<void>;
+    shutdown(): Promise<void>;
+
+    // Versioned memory operations
+    updateMemoryWithVersion(id: UUID, update: Partial<Memory>, expectedVersion: number): Promise<boolean>;
+    getLatestVersionWithLock(id: UUID): Promise<Memory | null>;
+}
+
+// Helper class for managing transactions
+export class TransactionScope {
+    private static transactionLevel = 0;
+    private static contexts: TransactionContext[] = [];
+    private committed = false;
+    private rolledBack = false;
+
+    constructor(private manager: TransactionManager) {}
+
+    static getCurrentLevel(): number {
+        return this.transactionLevel;
+    }
+
+    static getCurrentContext(): TransactionContext | undefined {
+        return this.contexts[this.contexts.length - 1];
+    }
+
+    async begin(): Promise<void> {
+        if (TransactionScope.transactionLevel === 0) {
+            await this.manager.beginTransaction();
+        }
+        TransactionScope.transactionLevel++;
+        TransactionScope.contexts.push({
+            level: TransactionScope.transactionLevel,
+            startTime: Date.now(),
+            operations: []
+        });
+    }
+
+    async commit(): Promise<void> {
+        if (this.committed || this.rolledBack) {
+            throw new Error("Transaction already completed");
+        }
+        
+        TransactionScope.transactionLevel--;
+        TransactionScope.contexts.pop();
+        
+        if (TransactionScope.transactionLevel === 0) {
+            await this.manager.commitTransaction();
+        }
+        this.committed = true;
+    }
+
+    async rollback(): Promise<void> {
+        if (this.committed || this.rolledBack) {
+            throw new Error("Transaction already completed");
+        }
+
+        TransactionScope.transactionLevel = 0;
+        TransactionScope.contexts = [];
+        await this.manager.rollbackTransaction();
+        this.rolledBack = true;
+    }
+
+    isCompleted(): boolean {
+        return this.committed || this.rolledBack;
+    }
+
+    getLevel(): number {
+        return TransactionScope.transactionLevel;
+    }
+
+    addOperation(operation: string): void {
+        const currentContext = TransactionScope.getCurrentContext();
+        if (currentContext) {
+            currentContext.operations.push(operation);
+        }
+    }
+}
+
+// Helper function for using transaction scope
+export async function withTransaction<T>(
+    manager: TransactionManager,
+    operation: () => Promise<T>
+): Promise<T> {
+    const scope = new TransactionScope(manager);
+    await scope.begin();
+    
+    try {
+        const result = await operation();
+        await scope.commit();
+        return result;
+    } catch (error) {
+        await scope.rollback();
+        throw error;
+    }
 }
 
 // Extend the core memory manager with event methods
-export type ExtendedMemoryManager = CoreMemoryManager & {
+export interface IExtendedMemoryManager extends IMemoryManager {
+    /** @deprecated Use subscribeToMemory instead */
+    subscribe(type: string, callback: (memory: Memory) => Promise<void>): void;
+    /** @deprecated Use unsubscribeFromMemory instead */
+    unsubscribe(type: string, callback: (memory: Memory) => Promise<void>): void;
+
+    // Versioned memory operations
+    updateMemoryWithVersion(id: UUID, update: Partial<Memory>, expectedVersion: number): Promise<boolean>;
+    getLatestVersionWithLock(id: UUID): Promise<Memory | null>;
+
+    // Backward compatibility aliases
     on(type: string, callback: (memory: any) => Promise<void>): void;
     off(type: string, callback: (memory: any) => Promise<void>): void;
-    emit?(type: string, memory: any): void;
 }
 
 // Use the extended memory manager in the runtime interface
 export interface IAgentRuntime extends CoreAgentRuntime {
-    messageManager: ExtendedMemoryManager;
+    messageManager: IExtendedMemoryManager;
 }
 
 // Define all possible statuses with clear descriptions
@@ -208,6 +386,7 @@ export function getValidTransitionsForType(type: string): Map<ContentStatus, Con
     return transitions;
 }
 
+// Add metadata interface with proper types
 export interface MemoryMetadata {
     targetAgent?: UUID;
     action?: string;
@@ -292,6 +471,7 @@ export interface MemoryMetadata {
     proposalType?: ProposalType;
     sourceId?: UUID;
     sourceAgent?: string;
+    minReputation?: number;  // Ensure this is typed as number
     [key: string]: unknown;
 }
 
@@ -339,7 +519,7 @@ export interface StrategyAgentConfig extends BaseAgentConfig {
 export type AgentConfig = ProposalAgentConfig | TreasuryAgentConfig | StrategyAgentConfig;
 
 // Update character mapping to be more explicit
-export type CharacterName = "Pion" | "Vela" | "Kron";
+export type CharacterName = "Pion" | "Vela" | "Kron" | "Nova";
 
 // Define AgentType as a string literal type to match runtime
 export type AgentType = "PROPOSAL" | "TREASURY" | "STRATEGY" | "USER";
@@ -356,48 +536,12 @@ export const AgentTypes = {
 export const CHARACTER_AGENT_MAPPING: Record<CharacterName, AgentType> = {
     "Pion": "PROPOSAL",
     "Vela": "TREASURY",
-    "Kron": "STRATEGY"
+    "Kron": "STRATEGY",
+    "Nova": "USER"
 } as const;
-
-// Required memory types for each agent
-export const REQUIRED_MEMORY_TYPES = {
-    PROPOSAL: [
-        "proposal_created",
-        "vote_cast",
-        "proposal_executed",
-        "proposal_execution_result"
-    ],
-    TREASURY: [
-        "swap_request",
-        "proposal_passed",
-        "strategy_triggered",
-        "deposit_received",
-        "transfer_requested"
-    ],
-    STRATEGY: [
-        "position_update",
-        "price_update",
-        "strategy_execution_result",
-        "strategy_execution",
-        "swap_completed",
-        "swap_failed"
-    ],
-    USER: [
-        "wallet_registration",
-        "deposit_received",
-        "vote_cast",
-        "proposal_created",
-        "strategy_execution_result"
-    ]
-} as const;
-
-// Memory type for each agent
-export type ProposalMemoryType = typeof REQUIRED_MEMORY_TYPES.PROPOSAL[number];
-export type TreasuryMemoryType = typeof REQUIRED_MEMORY_TYPES.TREASURY[number];
-export type StrategyMemoryType = typeof REQUIRED_MEMORY_TYPES.STRATEGY[number];
 
 // All memory types
-export type DAOMemoryType = ProposalMemoryType | TreasuryMemoryType | StrategyMemoryType;
+export type DAOMemoryType = keyof typeof MEMORY_SUBSCRIPTIONS;
 
 // Update BaseContent to include metadata and enforce memory types
 export interface BaseContent extends Content {
@@ -409,6 +553,8 @@ export interface BaseContent extends Content {
     updatedAt: number;
     status: ContentStatus;
     metadata?: MemoryMetadata;
+    version?: number;
+    versionTimestamp?: number;
 }
 
 export interface AgentMessage {
@@ -507,6 +653,10 @@ export const UNIQUE_MEMORY_TYPES = {
         uniqueBy: ["txHash"],
         description: "Unique transaction record"
     },
+    "distributed_lock": {
+        uniqueBy: ["key", "lockState"],
+        description: "Only one active lock per key"
+    },
     "agent_state": {
         uniqueBy: ["agentId"],
         description: "Current state for each agent"
@@ -521,7 +671,7 @@ export const UNIQUE_MEMORY_TYPES = {
     },
 
     // Voting records - Unique per user per proposal
-    "vote": {
+    "vote_cast": {
         uniqueBy: ["userId", "metadata.proposalId"],
         description: "One vote per user per proposal"
     },
@@ -592,32 +742,6 @@ export interface ProposalContent extends BaseContent {
     updatedAt: number;
 }
 
-// Add UserProfile interface
-export interface UserProfile extends BaseContent {
-    type: "user_profile";
-    userId: UUID;
-    proposalsCreated: number;
-    votesCount: number;
-    lastActive: number;
-    reputation: number;
-    votingPower: number;
-    roles: string[];
-    walletAddresses?: string[];
-    totalDeposits?: number;
-    metadata: MemoryMetadata & {
-        lastProposalId?: string;
-        lastVoteId?: string;
-        userStats?: {
-            proposalsCreated: number;
-            votesCount: number;
-            strategiesCreated?: number;
-            swapsExecuted?: number;
-            depositsProcessed?: number;
-            transfersProcessed?: number;
-        };
-    };
-}
-
 // Add StrategyExecutionResult type
 export interface StrategyExecutionResult extends BaseContent {
     type: "strategy_execution_result";
@@ -657,7 +781,7 @@ export interface CacheOptions {
 }
 
 export interface VoteContent extends BaseContent {
-    type: "vote";
+    type: "vote_cast";
     proposalId: UUID;
     vote: "yes" | "no";
     metadata: MemoryMetadata & {
@@ -701,4 +825,26 @@ export enum ContentStatusIndex {
 
 export function getContentStatus(index: ContentStatusIndex): ContentStatus {
     return index;
+}
+
+// Keep only the TransactionOptions interface
+export interface TransactionOptions {
+    maxRetries?: number;
+    timeoutMs?: number;
+    isolationLevel?: 'READ_COMMITTED' | 'REPEATABLE_READ' | 'SERIALIZABLE';
+    backoff?: {
+        initialDelayMs: number;
+        maxDelayMs: number;
+        factor: number;
+    };
+    lockKeys?: string[];
+}
+
+export interface DistributedLock {
+    lockId: UUID;
+    key: string;
+    holder: UUID;
+    expiresAt: number;
+    version: number;
+    [key: string]: unknown;
 } 

@@ -1,12 +1,13 @@
 import { Memory, UUID } from "@elizaos/core";
-import { BaseContent } from "./base";
+import { BaseContent } from "./base.ts";
 
 export interface MemoryEvent {
-    type: "memory_created" | "memory_updated" | "memory_deleted";
+    type: string;
     content: BaseContent;
     roomId: UUID;
     agentId: UUID;
     timestamp: number;
+    memory?: Memory;  // Add optional full Memory object
 }
 
 export interface MemorySubscription {

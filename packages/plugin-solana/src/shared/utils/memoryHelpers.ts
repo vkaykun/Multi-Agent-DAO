@@ -1,6 +1,6 @@
 import { IAgentRuntime, Memory, UUID, stringToUuid } from "@elizaos/core";
-import { BaseContent, ContentStatus } from "../types/base";
-import { ROOM_IDS } from "../constants";
+import { BaseContent, ContentStatus } from "../types/base.ts";
+import { ROOM_IDS } from "../constants.ts";
 
 interface StatusChangeParams {
     entityId: UUID;

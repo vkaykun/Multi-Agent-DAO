@@ -6,8 +6,8 @@ import {
     IMemoryManager,
     stringToUuid
 } from "@elizaos/core";
-import { BaseContent } from "../types/base";
-import { MemoryQueryOptions, PaginationOptions } from "../types/memory";
+import { BaseContent } from "../types/base.ts";
+import { MemoryQueryOptions, PaginationOptions } from "../types/memory.ts";
 
 export interface PaginatedResult<T> {
     items: T[];

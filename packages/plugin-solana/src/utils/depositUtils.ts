@@ -2,7 +2,7 @@
 
 import { Connection, ParsedTransactionWithMeta, PublicKey } from "@solana/web3.js";
 import { elizaLogger, IAgentRuntime, stringToUuid, Content } from "@elizaos/core";
-import { getWalletKey } from "../keypairUtils.js";
+import { getWalletKey } from "../keypairUtils.ts";
 
 export interface Deposit {
     amountSOL: number;
@@ -75,14 +75,14 @@ export async function verifyAndRecordDeposit(
                 count: 1000
             });
 
-            const matchingReg = registrations.find(
-                (mem) =>
-                    mem.content.type === "register_wallet" &&
-                    typeof mem.content.walletAddress === "string" &&
-                    mem.content.walletAddress.toLowerCase() === deposit.fromAddress.toLowerCase()
+            // Find matching wallet registration
+            const walletRegistration = registrations.find(mem =>
+                mem.content.type === "wallet_registration" &&
+                mem.content.walletAddress === deposit.fromAddress &&
+                mem.content.status === "executed"
             );
 
-            if (matchingReg) {
+            if (walletRegistration) {
                 // Record the deposit
                 const memoryId = stringToUuid(`deposit-${txSignature}-${Date.now()}`);
                 await runtime.messageManager.createMemory({
@@ -95,10 +95,10 @@ export async function verifyAndRecordDeposit(
                         timestamp: Date.now(),
                         txSignature: txSignature,
                         fromAddress: deposit.fromAddress,
-                        discordId: (matchingReg.content as any).discordId || matchingReg.userId,
+                        discordId: (walletRegistration.content as any).discordId || walletRegistration.userId,
                     } as DepositContent,
                     roomId: runtime.agentId,
-                    userId: matchingReg.userId,
+                    userId: walletRegistration.userId,
                     agentId: runtime.agentId,
                 });
 

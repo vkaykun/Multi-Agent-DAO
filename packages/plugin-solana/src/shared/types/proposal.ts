@@ -1,6 +1,6 @@
 import { UUID, stringToUuid } from "@elizaos/core";
-import { BaseContent, ContentStatus } from "./base";
-import { Vote, VoteStats } from "./vote";
+import { BaseContent, ContentStatus } from "./base.ts";
+import { Vote, VoteStats } from "./vote.ts";
 
 export type ProposalType = "swap" | "strategy" | "governance" | "parameter_change" | "other";
 
@@ -51,6 +51,7 @@ export interface OtherDetails extends BaseProposalDetails {
 export interface ProposalInterpretation {
     type: ProposalType;
     title: string;
+    description: string;
     details: SwapDetails | StrategyDetails | GovernanceDetails | ParameterChangeDetails | OtherDetails;
 }
 
@@ -113,7 +114,7 @@ export interface ProposalContent extends BaseContent {
 }
 
 export interface VoteContent extends BaseContent {
-    type: "vote";
+    type: "vote_cast";
     proposalId: string;
     userId: UUID;
     vote: "yes" | "no";

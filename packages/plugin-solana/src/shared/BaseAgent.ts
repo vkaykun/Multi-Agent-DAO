@@ -1,3 +1,5 @@
+// packages/plugin-solana/src/shared/BaseAgent.ts
+
 import {
     Memory,
     State,
@@ -5,7 +7,10 @@ import {
     stringToUuid,
     UUID,
     Content,
-    AgentRuntime
+    AgentRuntime,
+    ModelClass,
+    composeContext,
+    generateObject
 } from "@elizaos/core";
 import {
     AgentType,
@@ -16,11 +21,20 @@ import {
     CharacterName,
     DAOEventType,
     DAOEvent,
-    Transaction,
     IAgentRuntime,
-    REQUIRED_MEMORY_TYPES
-} from "./types/base";
-import { MemoryQueryOptions } from "./types/memory";
+    withTransaction,
+    ExtendedMemoryOptions,
+    ContentStatus,
+    isValidContentStatus,
+    ContentStatusIndex,
+    getContentStatus,
+    isValidStatusTransition,
+    MemoryMetadata,
+    TransactionManager,
+    DistributedLock,
+    IMemoryManager
+} from "./types/base.ts";
+import { MemoryQueryOptions } from "./types/memory.ts";
 import { 
     AGENT_IDS, 
     GLOBAL_MEMORY_TYPES, 
@@ -28,25 +42,26 @@ import {
     getMemoryRoom,
     AGENT_SPECIFIC_MEMORY_TYPES,
     AgentSpecificMemoryType 
-} from "./constants";
-import { CacheService } from "./services/CacheService";
-import { getPaginatedMemories, getAllMemories, processMemoriesInChunks } from './utils/memory';
-import { getMemoryManager } from "./memory/MemoryManagerFactory";
-import { MEMORY_SUBSCRIPTIONS, MemorySubscriptionConfig } from "./types/memory-subscriptions";
-import { MessageBroker } from './MessageBroker';
-import { MemoryEvent, MemorySubscription } from './types/memory-events';
-import { actionRegistry, ActionDefinition } from "./actions/registry";
+} from "./constants.ts";
+import { CacheService } from "./services/CacheService.ts";
+import { getPaginatedMemories, getAllMemories, processMemoriesInChunks } from './utils/memory.ts';
+import { getMemoryManager } from "./memory/MemoryManagerFactory.ts";
+import { MEMORY_SUBSCRIPTIONS, MemorySubscriptionConfig } from "./types/memory-subscriptions.ts";
+import { MessageBroker } from './MessageBroker.ts';
+import { MemoryEvent, MemorySubscription } from './types/memory-events.ts';
 import * as path from "path";
 import * as fs from "fs";
-import { exponentialBackoff } from './utils/backoff';
-import { getMemoryDomain, shouldArchiveMemory, isDescriptiveMemory } from './utils/memory-utils';
+import { exponentialBackoff } from './utils/backoff.ts';
+import { getMemoryDomain, shouldArchiveMemory, isDescriptiveMemory, getMemoryType } from './utils/memory-utils.ts';
+import { Connection, PublicKey } from "@solana/web3.js";
+import { ExtendedAgentRuntime } from "./utils/runtime.ts";
+import { validateAgentSubscriptions, SUBSCRIPTION_REGISTRY } from "./types/subscriptionRegistry.ts";
 
-// Local interface definitions
-interface DistributedLock {
-    key: string;
-    holder: UUID;
-    expiresAt: number;
-    lockId: number;
+// Add transaction interfaces
+interface ITransactionManager {
+    beginTransaction(options?: TransactionOptions): Promise<void>;
+    commitTransaction(): Promise<void>;
+    rollbackTransaction(): Promise<void>;
 }
 
 interface TransactionOptions {
@@ -58,34 +73,222 @@ interface TransactionOptions {
         maxDelayMs: number;
         factor: number;
     };
-    lockKeys?: string[];  // Add lock keys to transaction options
+    lockKeys?: string[];
+}
+
+// Local interface definitions
+interface DistributedLockContent extends BaseContent {
+    type: "distributed_lock";
+    key: string;
+    holder: UUID;
+    expiresAt: number;
+    lockId: UUID;
+    version: number;
+    lastRenewalAt: number;
+    renewalCount: number;
+    lockState: 'acquiring' | 'active' | 'releasing' | 'released';
+    previousLockId?: UUID;  // For tracking lock history
+    acquiredAt: number;
+}
+
+interface RoomState {
+    lastCreatedAt: number;
+    lastUpdatedAt: number;
+    lastId?: UUID;
+    processedIds: Set<string>;
+}
+
+// Add validation result interface
+interface ValidationResult {
+    isValid: boolean;
+    error?: string;
+    details?: Record<string, any>;
+}
+
+// Add validation context interface
+interface ValidationContext {
+    agentType: AgentType;
+    userId: UUID;
+    timestamp: number;
+    previousState?: any;
+    metadata?: Record<string, any>;
+}
+
+// Add error types for better error handling
+enum AgentErrorType {
+    VALIDATION_ERROR = 'VALIDATION_ERROR',
+    OPERATION_ERROR = 'OPERATION_ERROR',
+    PERMISSION_ERROR = 'PERMISSION_ERROR',
+    STATE_ERROR = 'STATE_ERROR',
+    RESOURCE_ERROR = 'RESOURCE_ERROR'
+}
+
+class AgentError extends Error {
+    constructor(
+        public type: AgentErrorType,
+        message: string,
+        public details?: Record<string, any>
+    ) {
+        super(message);
+        this.name = 'AgentError';
+    }
+}
+
+// Add transaction state tracking
+interface TransactionState {
+    isActive: boolean;
+    startTime: number;
+    operationName: string;
+    level: number;
+    parentOperation?: string;
+}
+
+// Add LLM validation interfaces
+interface LLMValidationResult<T> {
+    isValid: boolean;
+    data?: T;
+    error?: string;
+    rawResponse?: unknown;
+    validationErrors?: Array<{
+        field: string;
+        error: string;
+        value?: unknown;
+    }>;
+}
+
+interface LLMValidationOptions {
+    maxRetries?: number;
+    requireAllFields?: boolean;
+    allowExtraFields?: boolean;
+    fieldValidators?: Record<string, (value: unknown) => boolean>;
+    customValidator?: (data: unknown) => boolean;
+}
+
+// Add LLM error type
+enum LLMErrorType {
+    VALIDATION_ERROR = 'LLM_VALIDATION_ERROR',
+    PARSING_ERROR = 'LLM_PARSING_ERROR',
+    TIMEOUT_ERROR = 'LLM_TIMEOUT_ERROR',
+    RETRY_EXHAUSTED = 'LLM_RETRY_EXHAUSTED'
+}
+
+class LLMError extends Error {
+    constructor(
+        public type: LLMErrorType,
+        message: string,
+        public response?: unknown,
+        public validationErrors?: Array<{
+            field: string;
+            error: string;
+            value?: unknown;
+        }>
+    ) {
+        super(message);
+        this.name = 'LLMError';
+    }
+}
+
+// Add lock acquisition states
+enum LockAcquisitionState {
+    ACQUIRED = 'ACQUIRED',
+    FAILED_EXISTS = 'FAILED_EXISTS',
+    FAILED_TIMEOUT = 'FAILED_TIMEOUT',
+    FAILED_ERROR = 'FAILED_ERROR'
+}
+
+interface LockAcquisitionResult {
+    state: LockAcquisitionState;
+    lock?: DistributedLock;
+    error?: string;
+    existingHolder?: UUID;
+}
+
+// Add validation interfaces
+interface ValidationRule<T> {
+    validate: (value: T, context: ValidationContext) => Promise<ValidationResult>;
+    description: string;
+    errorMessage: string;
+    severity: 'error' | 'warning';
+    type: 'format' | 'semantic' | 'security' | 'business';
+}
+
+interface ValidationSchema<T> {
+    rules: ValidationRule<T>[];
+    requiredFields: (keyof T)[];
+    allowedFields?: (keyof T)[];
+    customValidators?: Array<(value: T, context: ValidationContext) => Promise<ValidationResult>>;
+    dependencies?: Partial<Record<keyof T, (keyof T)[]>>;
+    constraints?: {
+        minValue?: number;
+        maxValue?: number;
+        minLength?: number;
+        maxLength?: number;
+        pattern?: RegExp;
+        allowedValues?: unknown[];
+        [key: string]: unknown;
+    };
+}
+
+interface ValidationPipeline<T> {
+    preValidation?: (value: T) => Promise<T>;
+    mainValidation: ValidationSchema<T>;
+    postValidation?: (value: T) => Promise<ValidationResult>;
+    securityChecks?: ValidationRule<T>[];
+    businessRules?: ValidationRule<T>[];
+}
+
+// Add request tracking interface
+interface RequestTracking extends Omit<BaseContent, 'status'> {
+    type: "request_tracking";
+    id: UUID;
+    requestId: UUID;
+    sourceType: string;  // e.g. "swap_request", "strategy_triggered"
+    targetAgent: AgentType;
+    requestStatus: "pending" | "processing" | "completed" | "failed";  // Renamed from status to avoid conflict
+    status: ContentStatus;  // Use standard ContentStatus for BaseContent compatibility
+    processedAt?: number;
+    retryCount?: number;
+    error?: string;
+    metadata?: Record<string, unknown>;
+    text: string;  // Required by BaseContent
+    agentId: UUID;
+    createdAt: number;
+    updatedAt: number;
 }
 
 export abstract class BaseAgent {
     protected id: UUID;
-    protected runtime: IAgentRuntime;
+    protected runtime: ExtendedAgentRuntime;
     protected messageBroker: MessageBroker;
     protected state: AgentState;
     protected capabilities: Map<string, AgentCapability>;
     protected messageQueue: AgentMessage[];
     protected watchedRooms: Set<UUID>;
-    protected eventSubscriptions: Map<DAOEventType, ((event: DAOEvent) => Promise<void>)[]>;
+    protected eventSubscriptions: Map<string, Set<(event: DAOEvent) => Promise<void>>>;
     protected characterName?: string;
     protected sharedDatabase?: any;
-    protected settings: Map<string, unknown>;
+    protected settings: Map<string, any>;
     protected cacheService: CacheService;
     private _isInTransaction: boolean = false;
     private readonly LOCK_TIMEOUT = 30000;
     private readonly LOCK_RETRY_DELAY = 1000;
     private readonly MAX_LOCK_RETRIES = 5;
+    private readonly LOCK_RENEWAL_INTERVAL = 10000; // Renew every 10 seconds
+    private readonly LOCK_CLEANUP_INTERVAL = 60000; // Cleanup every minute
+    private cleanupInterval: NodeJS.Timeout | null = null;
+    private transactionState: TransactionState | null = null;
+    private processedRequests: Set<UUID> = new Set();
+    private readonly REQUEST_CLEANUP_INTERVAL = 3600000; // 1 hour
+    private requestCleanupInterval: NodeJS.Timeout | null = null;
 
+    // Remove memory monitoring config and state variables
     protected memoryMonitoringConfig = {
-        batchSize: 50,      // Maximum number of memories to process per fetch
-        errorThreshold: 3,  // Number of consecutive errors before backing off
-        resetThreshold: 5,  // Number of successful fetches before resetting interval
-        backoffFactor: 1.5, // Exponential backoff multiplier
-        minInterval: 1000,  // Minimum interval between fetches
-        maxInterval: 30000  // Maximum interval after backoff
+        minInterval: 1000,
+        maxInterval: 30000,
+        batchSize: 100,
+        errorThreshold: 3,
+        successThreshold: 5,
+        backoffFactor: 2
     };
 
     private currentInterval: number;
@@ -94,10 +297,26 @@ export abstract class BaseAgent {
     private lastProcessedTime: number = Date.now();
     private isProcessing: boolean = false;
     private monitoringTimeout: NodeJS.Timeout | null = null;
-    private roomLastProcessedTimes: Map<UUID, number> = new Map();
+    // Track both creation and update times per room
+    private roomProcessingState: Map<UUID, RoomState> = new Map();
     protected memorySubscriptions: Map<string, Set<(memory: Memory) => Promise<void>>> = new Map();
 
-    constructor(runtime: IAgentRuntime) {
+    // Track subscribed callbacks with unique IDs
+    private readonly subscribedCallbacks: Map<string, Map<string, {
+        callback: (memory: Memory) => Promise<void>;
+        localHandler?: (memory: Memory) => Promise<void>;
+        crossProcessHandler?: (event: MemoryEvent) => Promise<void>;
+    }>> = new Map();
+
+    // Counter for generating unique callback IDs
+    private callbackCounter: number = 0;
+
+    // Generate truly unique callback ID
+    private generateCallbackId(): string {
+        return `${this.runtime.agentId}_${Date.now()}_${this.callbackCounter++}`;
+    }
+
+    constructor(runtime: ExtendedAgentRuntime) {
         this.runtime = runtime;
         this.id = runtime.agentId;
         this.state = {
@@ -115,18 +334,18 @@ export abstract class BaseAgent {
         ]);
         this.eventSubscriptions = new Map();
         this.settings = new Map();
-        this.currentInterval = this.memoryMonitoringConfig.minInterval;
 
         // Initialize cache service
         this.cacheService = new CacheService(runtime);
 
-        // Start memory monitoring
-        this.startMemoryMonitoring();
-
-        // Set up required memory subscriptions
-        this.setupRequiredMemorySubscriptions();
-
+        // Remove setupRequiredMemorySubscriptions call from constructor
         this.messageBroker = MessageBroker.getInstance();
+
+        // Start lock cleanup process
+        this.startLockCleanup();
+
+        // Start request tracking cleanup
+        this.startRequestTracking();
     }
 
     public getId(): UUID {
@@ -231,10 +450,11 @@ export abstract class BaseAgent {
             // First store the memory
             await this.runtime.messageManager.createMemory(memory);
 
-            // Compose state for message processing
+            // Compose state for message processing - pass current memory directly
             const state = await this.runtime.composeState(memory, {
                 agentId: this.runtime.agentId,
-                roomId: roomId
+                roomId: roomId,
+                currentMemory: memory // Pass the current memory directly to ensure it's included in context
             });
 
             // Process through evaluators and actions pipeline
@@ -324,126 +544,237 @@ export abstract class BaseAgent {
     }
 
     public async initialize(): Promise<void> {
-        elizaLogger.info(`Initializing agent ${this.id}`);
-        
-        // Load and register actions
-        this.loadActions();
-        
-        // Setup memory subscriptions
-        await this.setupMemorySubscriptions();
-        
-        // Initialize message broker
-        this.messageBroker = MessageBroker.getInstance();
-        
-        // Setup cross-process event handling
-        await this.setupCrossProcessEvents();
+        try {
+            elizaLogger.info(`Initializing ${this.constructor.name}...`);
+            
+            // Setup memory subscriptions first
+            this.setupMemorySubscriptions();
+            
+            // Validate that the actual subscribed types match what's required in the registry
+            const { valid, missing } = validateAgentSubscriptions(
+                this.runtime.agentType,
+                new Set(Array.from(this.memorySubscriptions.keys()))
+            );
 
-        // Load previous state if exists
-        const previousStates = await this.runtime.messageManager.getMemories({
-            roomId: this.id,
-            count: 1
-        });
+            if (!valid) {
+                throw new Error(
+                    `Agent ${this.constructor.name} (${this.runtime.agentType}) missing required subscriptions: ${missing.join(', ')}`
+                );
+            }
 
-        const lastState = previousStates.find(memory => 
-            memory.content.type === "agent_state" &&
-            memory.userId === this.id
-        );
+            // Continue with rest of initialization
+            await this.setupCrossProcessEvents();
+            this.loadActions();
+            this.startLockCleanup();
+            this.startRequestTracking();
+            await this.loadProcessedRequests();
 
-        if (lastState) {
-            const previousState = lastState.content as unknown as AgentState;
-            this.state = {
-                ...previousState,
-                status: "active",
-                lastActive: Date.now()
-            };
+            elizaLogger.info(`${this.constructor.name} initialized successfully`);
+        } catch (error) {
+            elizaLogger.error(`Error initializing ${this.constructor.name}:`, error);
+            throw error;
         }
-
-        await this.persistState();
     }
 
     public async shutdown(): Promise<void> {
-        if (this.monitoringTimeout) {
-            clearTimeout(this.monitoringTimeout);
-            this.monitoringTimeout = null;
-        }
-        
-        this.isProcessing = false;
-        this.state.status = "inactive";
-        await this.persistState();
-
-        // Clean up all subscriptions
-        this.eventSubscriptions.clear();
-    }
-
-    protected async beginTransaction(): Promise<void> {
-        if (this._isInTransaction) {
-            throw new Error('Nested transactions are not allowed');
-        }
-        await this.runtime.messageManager.beginTransaction();
-        this._isInTransaction = true;
-    }
-
-    protected async commitTransaction(): Promise<void> {
-        if (!this._isInTransaction) {
-            throw new Error('No active transaction to commit');
-        }
-        await this.runtime.messageManager.commitTransaction();
-        this._isInTransaction = false;
-    }
-
-    protected async rollbackTransaction(): Promise<void> {
-        if (!this._isInTransaction) {
-            throw new Error('No active transaction to rollback');
-        }
-        await this.runtime.messageManager.rollbackTransaction();
-        this._isInTransaction = false;
-    }
-
-    protected async executeAtomicOperation<T>(operation: () => Promise<T>): Promise<T> {
-        if (this._isInTransaction) {
-            return operation();
-        }
+        elizaLogger.info(`Shutting down agent ${this.id}`);
 
         try {
-            await this.beginTransaction();
-            this._isInTransaction = true;
-            const result = await operation();
-            await this.commitTransaction();
-            return result;
-        } catch (error) {
-            if (this._isInTransaction) {
-                await this.rollbackTransaction();
+            // Clean up memory subscriptions
+            for (const [type, callbacks] of this.memorySubscriptions.entries()) {
+                for (const callback of callbacks) {
+                    // Unsubscribe from local memory manager
+                    if (this.runtime.messageManager) {
+                        this.runtime.messageManager.unsubscribeFromMemory(type, callback);
+                    }
+                }
             }
+            this.memorySubscriptions.clear();
+
+            // Clean up tracked callbacks and their handlers
+            for (const [type, typeCallbacks] of this.subscribedCallbacks.entries()) {
+                for (const handlers of typeCallbacks.values()) {
+                    // Unsubscribe local handler
+                    if (this.runtime.messageManager && handlers.localHandler) {
+                        this.runtime.messageManager.unsubscribeFromMemory(type, handlers.localHandler);
+                    }
+                    // Unsubscribe cross-process handler
+                    if (handlers.crossProcessHandler) {
+                        this.messageBroker.unsubscribe(type, handlers.crossProcessHandler);
+                    }
+                }
+            }
+            this.subscribedCallbacks.clear();
+
+            // Clean up event subscriptions
+            for (const [type, callbacks] of this.eventSubscriptions.entries()) {
+                callbacks.clear();
+            }
+            this.eventSubscriptions.clear();
+
+            // Clear message queue
+            this.messageQueue = [];
+
+            // Clear any active intervals
+            if (this.cleanupInterval) {
+                clearInterval(this.cleanupInterval);
+                this.cleanupInterval = null;
+            }
+
+            if (this.requestCleanupInterval) {
+                clearInterval(this.requestCleanupInterval);
+                this.requestCleanupInterval = null;
+            }
+
+            // Clear any active timeouts
+            if (this.monitoringTimeout) {
+                clearTimeout(this.monitoringTimeout);
+                this.monitoringTimeout = null;
+            }
+
+            // Update agent state
+            await this.updateState({
+                status: "inactive",
+                lastActive: Date.now()
+            });
+
+            elizaLogger.info(`Agent ${this.id} shutdown complete`);
+        } catch (error) {
+            elizaLogger.error(`Error during agent shutdown:`, error);
             throw error;
-        } finally {
-            this._isInTransaction = false;
         }
+    }
+
+    protected async withTransaction<T>(
+        operation: string,
+        executor: () => Promise<T>,
+        options: TransactionOptions = { timeoutMs: 30000 }
+    ): Promise<T> {
+        const { timeoutMs = 30000, maxRetries = 3 } = options;
+        let attempt = 0;
+
+        while (attempt < maxRetries) {
+            try {
+                // Create timeout promise
+                const timeoutPromise = new Promise<never>((_, reject) =>
+                    setTimeout(() => reject(new Error(`Transaction '${operation}' timed out after ${timeoutMs}ms`)), timeoutMs)
+                );
+
+                // Start transaction
+                if (!this._isInTransaction) {
+                    await this.runtime.messageManager.beginTransaction();
+                    this._isInTransaction = true;
+                    this.transactionState = {
+                        isActive: true,
+                        startTime: Date.now(),
+                        operationName: operation,
+                        level: 1,
+                        parentOperation: undefined
+                    };
+                }
+
+                try {
+                    // Race between transaction execution and timeout
+                    const result = await Promise.race([
+                        executor(),
+                        timeoutPromise
+                    ]);
+
+                    // If we get here, transaction succeeded
+                    await this.runtime.messageManager.commitTransaction();
+                    this._isInTransaction = false;
+                    this.transactionState = null;
+                    return result;
+                } catch (error) {
+                    // Handle timeout or other errors
+                    if (error.message.includes('timed out')) {
+                        elizaLogger.error(`Transaction '${operation}' timed out:`, {
+                            timeoutMs,
+                            attempt: attempt + 1,
+                            maxRetries,
+                            error
+                        });
+                    } else {
+                        elizaLogger.error(`Error in transaction '${operation}':`, {
+                            attempt: attempt + 1,
+                            maxRetries,
+                            error
+                        });
+                    }
+
+                    // Always try to rollback on error
+                    try {
+                        if (this._isInTransaction) {
+                            await this.runtime.messageManager.rollbackTransaction();
+                        }
+                    } catch (rollbackError) {
+                        elizaLogger.error(`Failed to rollback transaction '${operation}':`, rollbackError);
+                    } finally {
+                        this._isInTransaction = false;
+                        this.transactionState = null;
+                    }
+
+                    throw error;
+                }
+            } catch (error) {
+                attempt++;
+                
+                // If we've exhausted retries or it's not a timeout error, rethrow
+                if (attempt >= maxRetries || !error.message.includes('timed out')) {
+                    throw error;
+                }
+
+                // Calculate backoff delay for next retry
+                const backoffDelay = options.backoff?.initialDelayMs || 1000 * Math.pow(2, attempt);
+                elizaLogger.warn(`Retrying transaction '${operation}' after ${backoffDelay}ms delay`, {
+                    attempt,
+                    maxRetries,
+                    backoffDelay
+                });
+                
+                await new Promise(resolve => setTimeout(resolve, backoffDelay));
+            }
+        }
+
+        throw new Error(`Transaction '${operation}' failed after ${maxRetries} attempts`);
     }
 
     protected async createMemory(content: BaseContent): Promise<void> {
-        const domain = getMemoryDomain(content.type);
-        const isArchived = shouldArchiveMemory(content.type, content.status);
-        const isDescriptive = isDescriptiveMemory(content.type);
+        return this.executeWithValidation(
+            'createMemory',
+            content,
+            async (memoryContent) => {
+                // Generate a consistent ID to be used for both memory.id and memory.content.id
+                const memoryId = memoryContent.id || stringToUuid(`mem-${Date.now()}`);
+                
+                const memory: Memory = {
+                    id: memoryId,
+                    content: {
+                        ...memoryContent,
+                        // Ensure content.id matches memory.id for consistent conversation handling
+                        id: memoryId,
+                        agentId: this.runtime.agentId,
+                        createdAt: memoryContent.createdAt || Date.now(),
+                        updatedAt: memoryContent.updatedAt || Date.now(),
+                        metadata: {
+                            ...memoryContent.metadata,
+                            // Add memory type as a tag
+                            tags: [
+                                ...(memoryContent.metadata?.tags || []),
+                                getMemoryType(memoryContent.type, memoryContent.status)
+                            ].filter(Boolean)
+                        }
+                    },
+                    roomId: getMemoryRoom(memoryContent.type, this.runtime.agentId),
+                    userId: this.runtime.agentId,
+                    agentId: this.runtime.agentId
+                };
 
-        // Choose appropriate memory manager
-        const manager = isDescriptive ? this.runtime.descriptionManager :
-                       isArchived ? this.runtime.loreManager :
-                       this.runtime.messageManager;
-
-        const memory: Memory = {
-            id: content.id || stringToUuid(`mem-${Date.now()}`),
-            content: {
-                ...content,
-                agentId: this.runtime.agentId,
-                createdAt: content.createdAt || Date.now(),
-                updatedAt: content.updatedAt || Date.now()
-            },
-            roomId: getMemoryRoom(content.type, this.runtime.agentId),
-            userId: this.runtime.agentId,
-            agentId: this.runtime.agentId
-        };
-
-        await manager.createMemory(memory);
+                await this.withTransaction('createMemory', async () => {
+                    await this.runtime.messageManager.createMemory(memory);
+                });
+            }
+        );
     }
 
     protected async queryMemories<T extends BaseContent>(options: {
@@ -452,15 +783,7 @@ export abstract class BaseAgent {
         sort?: (a: T, b: T) => number;
         limit?: number;
     }): Promise<T[]> {
-        const domain = getMemoryDomain(options.type);
-        const isArchived = shouldArchiveMemory(options.type);
-        const isDescriptive = isDescriptiveMemory(options.type);
-
-        const manager = isDescriptive ? this.runtime.descriptionManager :
-                       isArchived ? this.runtime.loreManager :
-                       this.runtime.messageManager;
-
-        const memories = await manager.getMemories({
+        const memories = await this.runtime.messageManager.getMemories({
             roomId: getMemoryRoom(options.type, this.runtime.agentId),
             count: options.limit || 100
         });
@@ -480,119 +803,144 @@ export abstract class BaseAgent {
         return items;
     }
 
-    protected setupRequiredMemorySubscriptions(): void {
-        const requiredTypes = REQUIRED_MEMORY_TYPES[this.runtime.agentType] || [];
-        for (const type of requiredTypes) {
-            this.runtime.messageManager.on(type, async (memory: Memory) => {
+    protected setupMemorySubscriptions(): void {
+        const agentType = this.runtime.agentType;
+        
+        // Get all required types for this agent from SUBSCRIPTION_REGISTRY
+        const requiredTypes = SUBSCRIPTION_REGISTRY[agentType];
+        if (!requiredTypes) {
+            throw new Error(`No required memory types defined for agent type: ${agentType}`);
+        }
+
+        // First validate all required types have subscription configs
+        const missingConfigs = requiredTypes.filter(type => !MEMORY_SUBSCRIPTIONS[type]);
+        if (missingConfigs.length > 0) {
+            throw new Error(
+                `Missing subscription configs for required types: ${missingConfigs.join(", ")} ` +
+                `in agent type: ${agentType}. Either add configs to MEMORY_SUBSCRIPTIONS or ` +
+                `remove from SUBSCRIPTION_REGISTRY.`
+            );
+        }
+
+        // Set up subscriptions for all required types
+        requiredTypes.forEach(type => {
+            const config = MEMORY_SUBSCRIPTIONS[type];
+            if (!config.requiredBy.includes(agentType)) {
+                throw new Error(
+                    `Memory type "${type}" is required by ${agentType} but not listed in ` +
+                    `MEMORY_SUBSCRIPTIONS[${type}].requiredBy`
+                );
+            }
+
+            // Subscribe with base handler
+            this.subscribeToMemory(type, async (memory: Memory) => {
                 await this.handleMemory(memory);
             });
-        }
+        });
+
+        // Log subscription setup
+        elizaLogger.info(`Set up memory subscriptions for ${agentType}:`, {
+            required: requiredTypes,
+            subscribed: Array.from(this.memorySubscriptions.keys())
+        });
     }
 
     protected subscribeToMemory(type: string, callback: (memory: Memory) => Promise<void>): void {
+        // Validate that this agent type is allowed to subscribe to this memory type
+        const config = MEMORY_SUBSCRIPTIONS[type];
+        if (!config) {
+            elizaLogger.error(`Attempting to subscribe to unregistered memory type: ${type}`);
+            return;
+        }
+        
+        if (!config.requiredBy.includes(this.runtime.agentType)) {
+            elizaLogger.error(
+                `Agent ${this.runtime.agentType} attempting to subscribe to unauthorized memory type: ${type}. ` +
+                `Allowed agents: ${config.requiredBy.join(", ")}`
+            );
+            return;
+        }
+
+        // Initialize type tracking if needed
+        if (!this.subscribedCallbacks.has(type)) {
+            this.subscribedCallbacks.set(type, new Map());
+        }
+
+        // Add to memorySubscriptions map for validation
         if (!this.memorySubscriptions.has(type)) {
             this.memorySubscriptions.set(type, new Set());
         }
-        this.memorySubscriptions.get(type)?.add(callback);
-        this.runtime.messageManager.on(type, callback);
+        this.memorySubscriptions.get(type)!.add(callback);
+
+        // Generate unique ID for this callback
+        const callbackId = this.generateCallbackId();
+        const typeCallbacks = this.subscribedCallbacks.get(type)!;
+
+        // Create handlers for both local and cross-process events
+        const localHandler = async (memory: Memory) => {
+            // Skip self-generated memories
+            if (memory.agentId === this.runtime.agentId) {
+                return;
+            }
+            await callback(memory);
+        };
+
+        const crossProcessHandler = async (event: MemoryEvent) => {
+            if (event.memory && event.agentId !== this.runtime.agentId) {
+                await callback(event.memory);
+            }
+        };
+
+        // Store all handlers for cleanup
+        typeCallbacks.set(callbackId, {
+            callback,
+            localHandler,
+            crossProcessHandler
+        });
+
+        // Set up subscriptions if first callback for this type
+        if (typeCallbacks.size === 1) {
+            if (this.runtime.messageManager) {
+                // Subscribe to local memory manager
+                this.runtime.messageManager.subscribeToMemory(type, localHandler);
+
+                // Subscribe to cross-process events
+                this.messageBroker.subscribe(type, crossProcessHandler);
+            } else {
+                elizaLogger.error(`MessageManager not available in runtime for agent type ${this.runtime.agentType}`);
+            }
+        }
+
+        elizaLogger.debug(`Added subscription for type ${type}, callback ${callbackId}, total subscribers: ${typeCallbacks.size}`);
     }
 
     protected unsubscribeFromMemory(type: string, callback: (memory: Memory) => Promise<void>): void {
-        this.memorySubscriptions.get(type)?.delete(callback);
-        if (this.memorySubscriptions.get(type)?.size === 0) {
-            this.memorySubscriptions.delete(type);
-        }
-        this.runtime.messageManager.off(type, callback);
-    }
+        const typeCallbacks = this.subscribedCallbacks.get(type);
+        if (!typeCallbacks) return;
 
-    protected async setupMemorySubscriptions(): Promise<void> {
-        const requiredTypes = REQUIRED_MEMORY_TYPES[this.runtime.agentType] || [];
-        for (const type of requiredTypes) {
-            this.runtime.messageManager.on(type, async (memory: Memory) => {
-                await this.handleMemory(memory);
-            });
-        }
-    }
-
-    // Update memory monitoring to use pagination
-    private async monitorMemories(): Promise<void> {
-        if (this.isProcessing) return;
-        this.isProcessing = true;
-
-        try {
-            for (const roomId of this.watchedRooms) {
-                const lastTime = this.roomLastProcessedTimes.get(roomId) || 0;
-                const result = await getPaginatedMemories(this.runtime.messageManager, roomId, {
-                    type: "memory",
-                    pagination: {
-                        pageSize: this.memoryMonitoringConfig.batchSize,
-                        maxPages: 1
-                    },
-                    filter: (content: BaseContent) => {
-                        return content.createdAt > lastTime;
+        // Find and remove the callback entry
+        for (const [callbackId, handlers] of typeCallbacks.entries()) {
+            if (handlers.callback === callback) {
+                // Clean up local subscription if last callback
+                if (typeCallbacks.size === 1) {
+                    if (this.runtime.messageManager && handlers.localHandler) {
+                        this.runtime.messageManager.unsubscribeFromMemory(type, handlers.localHandler);
                     }
-                });
-
-                if (result.items.length > 0) {
-                    // Process memories in order
-                    for (const item of result.items) {
-                        // Skip own memories
-                        if (item.agentId === this.id) continue;
-
-                        // Create proper Memory object
-                        const memory: Memory = {
-                            id: stringToUuid(`mem-${Date.now()}`),
-                            content: item,
-                            roomId,
-                            userId: item.agentId,
-                            agentId: this.runtime.agentId
-                        };
-
-                        // Process memory
-                        await this.handleMemory(memory);
-
-                        // Update last processed time for this room
-                        if (item.createdAt > lastTime) {
-                            this.roomLastProcessedTimes.set(roomId, item.createdAt);
-                        }
-                    }
-
-                    // Successful fetch with data
-                    this.successfulFetches++;
-                    this.consecutiveErrors = 0;
-
-                    // Reset interval if we've had enough successful fetches
-                    if (this.successfulFetches >= this.memoryMonitoringConfig.resetThreshold) {
-                        this.currentInterval = this.memoryMonitoringConfig.minInterval;
-                        this.successfulFetches = 0;
+                    if (handlers.crossProcessHandler) {
+                        this.messageBroker.unsubscribe(type, handlers.crossProcessHandler);
                     }
                 }
-            }
-        } catch (error) {
-            elizaLogger.error("Error monitoring memories:", error);
-            this.consecutiveErrors++;
-            
-            // Apply backoff if we've hit the error threshold
-            if (this.consecutiveErrors >= this.memoryMonitoringConfig.errorThreshold) {
-                this.currentInterval = Math.min(
-                    this.currentInterval * this.memoryMonitoringConfig.backoffFactor,
-                    this.memoryMonitoringConfig.maxInterval
-                );
-            }
-        } finally {
-            this.isProcessing = false;
-            
-            // Schedule next check
-            if (this.monitoringTimeout) {
-                clearTimeout(this.monitoringTimeout);
-            }
-            this.monitoringTimeout = setTimeout(() => this.monitorMemories(), this.currentInterval);
-        }
-    }
 
-    private startMemoryMonitoring(): void {
-        this.currentInterval = this.memoryMonitoringConfig.minInterval;
-        this.monitorMemories();
+                typeCallbacks.delete(callbackId);
+                elizaLogger.debug(`Removed subscription for type ${type}, callback ${callbackId}`);
+                break;
+            }
+        }
+
+        // Clean up type tracking if no more callbacks
+        if (typeCallbacks.size === 0) {
+            this.subscribedCallbacks.delete(type);
+        }
     }
 
     public async setDatabase(database: any): Promise<void> {
@@ -612,8 +960,8 @@ export abstract class BaseAgent {
             });
 
             // Notify subscribers
-            const subscribers = this.eventSubscriptions.get(event.type) || [];
-            await Promise.all(subscribers.map(callback => callback(event)));
+            const subscribers = this.eventSubscriptions.get(event.type) || new Set();
+            await Promise.all(Array.from(subscribers).map(callback => callback(event)));
 
             elizaLogger.info(`Broadcasted event ${event.type} from ${this.runtime.agentType}`);
         } catch (error) {
@@ -622,26 +970,45 @@ export abstract class BaseAgent {
         }
     }
 
-    public subscribeToEvent(
-        eventType: DAOEventType,
-        callback: (event: DAOEvent) => Promise<void>
-    ): void {
-        const subscribers = this.eventSubscriptions.get(eventType) || [];
-        subscribers.push(callback);
-        this.eventSubscriptions.set(eventType, subscribers);
-        elizaLogger.info(`${this.runtime.agentType} subscribed to event type: ${eventType}`);
+    public async subscribeToEvent(type: DAOEventType, callback: (event: DAOEvent) => Promise<void>): Promise<void> {
+        if (!this.eventSubscriptions.has(type)) {
+            this.eventSubscriptions.set(type, new Set());
+        }
+        this.eventSubscriptions.get(type)?.add(callback);
     }
 
-    public unsubscribeFromEvent(
-        eventType: DAOEventType,
-        callback: (event: DAOEvent) => Promise<void>
-    ): void {
-        const subscribers = this.eventSubscriptions.get(eventType) || [];
-        const index = subscribers.indexOf(callback);
-        if (index > -1) {
-            subscribers.splice(index, 1);
-            this.eventSubscriptions.set(eventType, subscribers);
-            elizaLogger.info(`${this.runtime.agentType} unsubscribed from event type: ${eventType}`);
+    public async unsubscribeFromEvent(type: DAOEventType, callback: (event: DAOEvent) => Promise<void>): Promise<void> {
+        const callbacks = this.eventSubscriptions.get(type);
+        if (callbacks) {
+            callbacks.delete(callback);
+            if (callbacks.size === 0) {
+                this.eventSubscriptions.delete(type);
+            }
+        }
+    }
+
+    protected async notifyEventSubscribers(event: DAOEvent): Promise<void> {
+        const callbacks = this.eventSubscriptions.get(event.type);
+        if (!callbacks) return;
+
+        const errors: Error[] = [];
+        const promises: Promise<void>[] = [];
+
+        for (const callback of callbacks) {
+            promises.push((async () => {
+                try {
+                    await callback(event);
+                } catch (error) {
+                    errors.push(error as Error);
+                    elizaLogger.error(`Error in event subscriber for ${event.type}:`, error);
+                }
+            })());
+        }
+
+        await Promise.all(promises);
+
+        if (errors.length > 0) {
+            elizaLogger.error(`${errors.length} errors occurred while notifying event subscribers`);
         }
     }
 
@@ -659,65 +1026,856 @@ export abstract class BaseAgent {
         return new Map(this.settings);
     }
 
-    protected abstract handleMemory(memory: Memory): Promise<void>;
+    protected async handleMemory(memory: Memory): Promise<void> {
+        // Skip processing if memory is from this agent
+        if (memory.agentId === this.runtime.agentId) {
+            return;
+        }
+
+        // Allow derived classes to extend behavior by implementing handleMemoryExtended
+        await this.handleMemoryExtended(memory);
+    }
+
+    // New protected method for derived classes to implement additional memory handling
+    protected async handleMemoryExtended(memory: Memory): Promise<void> {
+        // Default implementation does nothing
+        // Derived classes can override this to add custom memory handling logic
+    }
 
     protected abstract loadActions(): void;
     protected abstract setupCrossProcessEvents(): Promise<void>;
 
-    protected async acquireDistributedLock(
-        key: string,
-        timeoutMs: number = this.LOCK_TIMEOUT
-    ): Promise<DistributedLock | null> {
-        const lockId = this.generateLockId(key);
-        const expiresAt = Date.now() + timeoutMs;
+    private startLockCleanup(): void {
+        if (this.cleanupInterval) {
+            clearInterval(this.cleanupInterval);
+        }
 
-        try {
-            // Create lock record in memory store
-            await this.runtime.messageManager.createMemory({
-                id: stringToUuid(`lock-${key}-${lockId}`),
-                content: {
-                    type: "distributed_lock",
+        this.cleanupInterval = setInterval(async () => {
+            await this.cleanupExpiredLocks();
+        }, this.LOCK_CLEANUP_INTERVAL);
+    }
+
+    private async cleanupExpiredLocks(): Promise<void> {
+        await this.withTransaction('cleanupExpiredLocks', async () => {
+            try {
+                // Get all locks with row-level locking
+                const locks = await this.runtime.messageManager.getMemoriesWithLock({
+                    roomId: this.id,
+                    count: 1000,
+                    filter: {
+                        type: "distributed_lock"
+                    }
+                });
+
+                const now = Date.now();
+                const locksToClean = locks.filter(lockMemory => {
+                    const content = lockMemory.content as DistributedLockContent;
+                    return content.expiresAt <= now || 
+                           content.lastRenewalAt + this.LOCK_RENEWAL_INTERVAL * 2 <= now ||
+                           content.lockState === 'releasing';
+                });
+
+                // Process each lock in its own nested transaction to maintain isolation
+                for (const lockMemory of locksToClean) {
+                    const content = lockMemory.content as DistributedLockContent;
+                    
+                    // Start a nested transaction for this specific lock
+                    await this.withTransaction(`cleanupLock-${content.key}`, async () => {
+                        // Re-check the lock state with row-level locking
+                        const currentLock = await this.runtime.messageManager.getMemoryWithLock(lockMemory.id);
+                        
+                        // Only remove if the lock is still in the same state
+                        if (currentLock && 
+                            (currentLock.content as DistributedLockContent).version === content.version) {
+                            await this.runtime.messageManager.removeMemory(lockMemory.id);
+                            elizaLogger.debug(`Cleaned up lock for ${content.key} (v${content.version})`);
+                        }
+                    }, {
+                        isolationLevel: 'SERIALIZABLE',
+                        lockKeys: [`lock-${content.key}`]
+                    });
+                }
+            } catch (error) {
+                elizaLogger.error("Error cleaning up locks:", error);
+                throw error;
+            }
+        });
+    }
+
+    protected async acquireDistributedLock(key: string, timeoutMs: number = 30000): Promise<DistributedLock | null> {
+        return await this.withTransaction('acquireLock', async () => {
+            const now = Date.now();
+            const expiresAt = now + timeoutMs;
+            const lockId = stringToUuid(`lock-${key}-${now}`);
+
+            try {
+                // First, get and remove any expired locks for this key
+                const expiredLocks = await this.runtime.messageManager.getMemories({
+                    roomId: ROOM_IDS.DAO,
+                    count: 100
+                });
+
+                // Filter and remove expired locks within the same transaction
+                for (const lock of expiredLocks) {
+                    const content = lock.content as any;
+                    if (content.type === "distributed_lock" && 
+                        content.key === key && 
+                        (content.expiresAt <= now || content.lockState !== 'active')) {
+                        await this.runtime.messageManager.removeMemory(lock.id);
+                    }
+                }
+
+                // Try to insert the lock directly as active
+                await this.runtime.messageManager.createMemory({
+                    id: lockId,
+                    content: {
+                        type: "distributed_lock",
+                        key,
+                        holder: this.runtime.agentId,
+                        expiresAt,
+                        lockId,
+                        version: 1,
+                        lastRenewalAt: now,
+                        renewalCount: 0,
+                        lockState: 'active',
+                        acquiredAt: now,
+                        text: `Lock ${key} acquired by ${this.runtime.agentId}`,
+                        agentId: this.runtime.agentId,
+                        createdAt: now,
+                        updatedAt: now,
+                        status: "executed"
+                    },
+                    roomId: ROOM_IDS.DAO,
+                    userId: this.runtime.agentId,
+                    agentId: this.runtime.agentId,
+                    unique: true
+                });
+
+                // If we get here, we successfully acquired the lock
+                return {
                     key,
-                    holder: this.id,
+                    holder: this.runtime.agentId,
                     expiresAt,
                     lockId,
-                    text: `Lock acquired for ${key}`,
-                    agentId: this.id,
-                    createdAt: Date.now(),
-                    updatedAt: Date.now()
+                    version: 1
+                };
+
+            } catch (error) {
+                if (error.message?.includes('unique constraint')) {
+                    // Lock already exists and is active
+                    return null;
+                }
+                throw error;
+            }
+        });
+    }
+
+    private async processMemory(memory: Memory): Promise<void> {
+        try {
+            // Skip own memories
+            if (memory.agentId === this.runtime.agentId) return;
+
+            // Process memory through handleMemory
+            await this.handleMemory(memory);
+        } catch (error) {
+            elizaLogger.error("Error processing memory:", error);
+        }
+    }
+
+    protected async validateWithSchema<T extends Record<string, unknown>>(
+        value: T,
+        schema: ValidationSchema<T>,
+        context: ValidationContext
+    ): Promise<ValidationResult> {
+        const errors: Array<{field?: string; error: string; type: string}> = [];
+
+        // 1. Check required fields
+        for (const field of schema.requiredFields) {
+            if (!(field in value) || value[field] === undefined || value[field] === null) {
+                errors.push({
+                    field: String(field),
+                    error: `Missing required field: ${String(field)}`,
+                    type: 'format'
+                });
+            }
+        }
+
+        // 2. Check allowed fields if specified
+        if (schema.allowedFields) {
+            const extraFields = Object.keys(value).filter(
+                key => !schema.allowedFields!.includes(key as keyof T)
+            );
+            if (extraFields.length > 0) {
+                errors.push({
+                    error: `Unexpected fields: ${extraFields.join(', ')}`,
+                    type: 'format'
+                });
+            }
+        }
+
+        // 3. Check field dependencies
+        if (schema.dependencies) {
+            for (const [field, deps] of Object.entries(schema.dependencies)) {
+                if (field in value && value[field] !== undefined) {
+                    for (const dep of deps) {
+                        if (!(dep in value) || value[dep] === undefined) {
+                            errors.push({
+                                field: String(field),
+                                error: `Field ${field} requires ${String(dep)}`,
+                                type: 'semantic'
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Apply validation rules
+        for (const rule of schema.rules) {
+            const result = await rule.validate(value, context);
+            if (!result.isValid) {
+                errors.push({
+                    error: result.error || rule.errorMessage,
+                    type: rule.type
+                });
+            }
+        }
+
+        // 5. Apply custom validators
+        if (schema.customValidators) {
+            for (const validator of schema.customValidators) {
+                const result = await validator(value, context);
+                if (!result.isValid) {
+                    errors.push({
+                        error: result.error || 'Custom validation failed',
+                        type: 'semantic'
+                    });
+                }
+            }
+        }
+
+        // 6. Check constraints
+        if (schema.constraints) {
+            for (const [field, fieldValue] of Object.entries(value)) {
+                const constraints = schema.constraints;
+                
+                // Type guard for number values
+                if (typeof fieldValue === 'number') {
+                    const minValue = constraints.minValue;
+                    const maxValue = constraints.maxValue;
+                    
+                    if (typeof minValue === 'number') {
+                        const numValue = fieldValue as number;
+                        if (numValue < minValue) {
+                            errors.push({
+                                field,
+                                error: `Value must be >= ${minValue}`,
+                                type: 'semantic'
+                            });
+                        }
+                    }
+                    if (typeof maxValue === 'number') {
+                        const numValue = fieldValue as number;
+                        if (numValue > maxValue) {
+                            errors.push({
+                                field,
+                                error: `Value must be <= ${maxValue}`,
+                                type: 'semantic'
+                            });
+                        }
+                    }
+                }
+
+                // Type guard for string values
+                if (typeof fieldValue === 'string') {
+                    const minLength = constraints.minLength;
+                    const maxLength = constraints.maxLength;
+                    const pattern = constraints.pattern;
+                    
+                    if (typeof minLength === 'number') {
+                        const strValue = fieldValue as string;
+                        if (strValue.length < minLength) {
+                            errors.push({
+                                field,
+                                error: `Length must be >= ${minLength}`,
+                                type: 'format'
+                            });
+                        }
+                    }
+                    if (typeof maxLength === 'number') {
+                        const strValue = fieldValue as string;
+                        if (strValue.length > maxLength) {
+                            errors.push({
+                                field,
+                                error: `Length must be <= ${maxLength}`,
+                                type: 'format'
+                            });
+                        }
+                    }
+                    if (pattern instanceof RegExp) {
+                        const strValue = fieldValue as string;
+                        if (!pattern.test(strValue)) {
+                            errors.push({
+                                field,
+                                error: 'Invalid format',
+                                type: 'format'
+                            });
+                        }
+                    }
+                }
+                
+                // Type guard for allowed values
+                const allowedValues = constraints.allowedValues;
+                if (Array.isArray(allowedValues) && !allowedValues.includes(fieldValue)) {
+                    errors.push({
+                        field,
+                        error: `Value must be one of: ${allowedValues.join(', ')}`,
+                        type: 'semantic'
+                    });
+                }
+            }
+        }
+
+        return {
+            isValid: errors.length === 0,
+            error: errors.length > 0 ? errors[0].error : undefined,
+            details: errors.length > 0 ? { errors } : undefined
+        };
+    }
+
+    protected async executeValidationPipeline<T extends Record<string, unknown>>(
+        value: T,
+        pipeline: ValidationPipeline<T>,
+        context: ValidationContext
+    ): Promise<ValidationResult> {
+        try {
+            // 1. Pre-validation transformation
+            let transformedValue = value;
+            if (pipeline.preValidation) {
+                transformedValue = await pipeline.preValidation(value);
+            }
+
+            // 2. Main schema validation
+            const mainResult = await this.validateWithSchema(
+                transformedValue,
+                pipeline.mainValidation,
+                context
+            );
+            if (!mainResult.isValid) {
+                return mainResult;
+            }
+
+            // 3. Security checks
+            if (pipeline.securityChecks) {
+                for (const check of pipeline.securityChecks) {
+                    const securityResult = await check.validate(transformedValue, context);
+                    if (!securityResult.isValid) {
+                        return {
+                            isValid: false,
+                            error: `Security check failed: ${securityResult.error}`,
+                            details: {
+                                type: 'security',
+                                ...securityResult.details
+                            }
+                        };
+                    }
+                }
+            }
+
+            // 4. Business rules
+            if (pipeline.businessRules) {
+                for (const rule of pipeline.businessRules) {
+                    const ruleResult = await rule.validate(transformedValue, context);
+                    if (!ruleResult.isValid) {
+                        return {
+                            isValid: false,
+                            error: `Business rule failed: ${ruleResult.error}`,
+                            details: {
+                                type: 'business',
+                                ...ruleResult.details
+                            }
+                        };
+                    }
+                }
+            }
+
+            // 5. Post-validation
+            if (pipeline.postValidation) {
+                const postResult = await pipeline.postValidation(transformedValue);
+                if (!postResult.isValid) {
+                    return postResult;
+                }
+            }
+
+            return { isValid: true };
+
+        } catch (error) {
+            return {
+                isValid: false,
+                error: `Validation pipeline error: ${error instanceof Error ? error.message : String(error)}`,
+                details: { error }
+            };
+        }
+    }
+
+    // Common security validation rules
+    protected getSecurityValidationRules<T>(): ValidationRule<T>[] {
+        return [
+            {
+                validate: async (value: T) => {
+                    // Check for common injection patterns
+                    const stringified = JSON.stringify(value);
+                    const injectionPatterns = [
+                        /\b(exec|eval|function|setTimeout|setInterval)\s*\(/i,
+                        /<script\b[^>]*>/i,
+                        /javascript:/i,
+                        /data:/i,
+                        /vbscript:/i,
+                        /onload\s*=/i,
+                        /onclick\s*=/i
+                    ];
+
+                    for (const pattern of injectionPatterns) {
+                        if (pattern.test(stringified)) {
+                            return {
+                                isValid: false,
+                                error: 'Potential injection attack detected',
+                                details: { pattern: pattern.source }
+                            };
+                        }
+                    }
+                    return { isValid: true };
                 },
-                roomId: this.id,
-                userId: this.id,
-                agentId: this.id,
-                unique: true // Ensure only one lock exists
+                description: 'Check for common injection patterns',
+                errorMessage: 'Security validation failed',
+                severity: 'error',
+                type: 'security'
+            },
+            {
+                validate: async (value: T) => {
+                    // Check for oversized inputs
+                    const size = new TextEncoder().encode(JSON.stringify(value)).length;
+                    const MAX_SIZE = 1024 * 1024; // 1MB
+                    if (size > MAX_SIZE) {
+                        return {
+                            isValid: false,
+                            error: 'Input size exceeds maximum allowed',
+                            details: { size, maxSize: MAX_SIZE }
+                        };
+                    }
+                    return { isValid: true };
+                },
+                description: 'Check input size limits',
+                errorMessage: 'Input size validation failed',
+                severity: 'error',
+                type: 'security'
+            }
+        ];
+    }
+
+    // Common business validation rules
+    protected getBusinessValidationRules<T extends BaseContent>(): ValidationRule<T>[] {
+        return [
+            {
+                validate: async (value: T, context: ValidationContext) => {
+                    // Check if user has required permissions
+                    const userProfile = await this.getUserProfile(context.userId);
+                    if (!userProfile) {
+                        return {
+                            isValid: false,
+                            error: 'User profile not found',
+                            details: { userId: context.userId }
+                        };
+                    }
+
+                    // Check if user has required reputation/role
+                    const minReputation = value.metadata?.minReputation;
+                    if (typeof minReputation === 'number' && 
+                        (!userProfile.reputation || 
+                         userProfile.reputation < minReputation)) {
+                        return {
+                            isValid: false,
+                            error: 'Insufficient reputation for this operation',
+                            details: {
+                                required: minReputation,
+                                current: userProfile.reputation
+                            }
+                        };
+                    }
+
+                    return { isValid: true };
+                },
+                description: 'Check user permissions and requirements',
+                errorMessage: 'Permission validation failed',
+                severity: 'error',
+                type: 'business'
+            },
+            {
+                validate: async (value: T) => {
+                    // Check rate limits
+                    const now = Date.now();
+                    const recentMemories = await this.getMemoriesWithFilter({
+                        roomId: this.runtime.agentId,
+                        count: 100,
+                        filter: {
+                            type: value.type,
+                            agentId: value.agentId,
+                            createdAt: { $gt: now - 3600000 } // Last hour
+                        }
+                    });
+
+                    const MAX_OPERATIONS_PER_HOUR = 100;
+                    if (recentMemories.length >= MAX_OPERATIONS_PER_HOUR) {
+                        return {
+                            isValid: false,
+                            error: 'Rate limit exceeded',
+                            details: {
+                                current: recentMemories.length,
+                                max: MAX_OPERATIONS_PER_HOUR,
+                                resetAt: now + 3600000
+                            }
+                        };
+                    }
+
+                    return { isValid: true };
+                },
+                description: 'Check rate limits',
+                errorMessage: 'Rate limit validation failed',
+                severity: 'error',
+                type: 'business'
+            }
+        ];
+    }
+
+    /**
+     * Validates LLM output against a schema with proper error handling
+     */
+    protected async validateLLMOutput<T>(
+        llmOutput: unknown,
+        schema: {
+            type: string;
+            required: string[];
+            properties: Record<string, {
+                type: string;
+                enum?: unknown[];
+                minimum?: number;
+                maximum?: number;
+                pattern?: string;
+            }>;
+        },
+        options: LLMValidationOptions = {}
+    ): Promise<LLMValidationResult<T>> {
+        try {
+            // Validate required fields
+            if (!llmOutput || typeof llmOutput !== 'object') {
+                return {
+                    isValid: false,
+                    error: 'Output must be an object',
+                    rawResponse: llmOutput
+                };
+            }
+
+            const parsed = llmOutput as Record<string, unknown>;
+
+            // Check required fields
+            for (const field of schema.required) {
+                if (!(field in parsed)) {
+                    return {
+                        isValid: false,
+                        error: `Required field '${field}' is missing`,
+                        rawResponse: llmOutput,
+                        validationErrors: [{
+                            field,
+                            error: 'Required field missing'
+                        }]
+                    };
+                }
+            }
+
+            return {
+                isValid: true,
+                data: parsed as T,
+                rawResponse: parsed
+            };
+        } catch (error) {
+            return {
+                isValid: false,
+                error: error instanceof Error ? error.message : 'Unknown validation error',
+                rawResponse: llmOutput
+            };
+        }
+    }
+
+    /**
+     * Retries LLM validation with exponential backoff
+     */
+    protected async retryLLMValidation<T>(
+        generator: () => Promise<unknown>,
+        schema: {
+            type: string;
+            required: string[];
+            properties: Record<string, {
+                type: string;
+                enum?: unknown[];
+                minimum?: number;
+                maximum?: number;
+                pattern?: string;
+            }>;
+        },
+        options: LLMValidationOptions & {
+            maxRetries?: number;
+            initialDelayMs?: number;
+            maxDelayMs?: number;
+            backoffFactor?: number;
+        } = {}
+    ): Promise<LLMValidationResult<T>> {
+        const {
+            maxRetries = 3,
+            initialDelayMs = 1000,
+            maxDelayMs = 10000,
+            backoffFactor = 2,
+            ...validationOptions
+        } = options;
+
+        let lastError: LLMValidationResult<T> | null = null;
+        let delay = initialDelayMs;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const llmOutput = await generator();
+                const result = await this.validateLLMOutput<T>(llmOutput, schema, validationOptions);
+
+                if (result.isValid) {
+                    return result;
+                }
+
+                lastError = result;
+                elizaLogger.warn(`LLM validation failed (attempt ${attempt}/${maxRetries}):`, result.validationErrors);
+
+                if (attempt < maxRetries) {
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay = Math.min(delay * backoffFactor, maxDelayMs);
+                }
+
+            } catch (error) {
+                lastError = {
+                    isValid: false,
+                    error: error instanceof Error ? error.message : 'Unknown error during retry',
+                    validationErrors: [{
+                        field: 'retry',
+                        error: 'Failed to generate or validate output',
+                        value: error
+                    }]
+                };
+                elizaLogger.error(`LLM retry error (attempt ${attempt}/${maxRetries}):`, error);
+
+                if (attempt < maxRetries) {
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay = Math.min(delay * backoffFactor, maxDelayMs);
+                }
+            }
+        }
+
+        throw new LLMError(
+            LLMErrorType.RETRY_EXHAUSTED,
+            `Failed to validate LLM output after ${maxRetries} attempts`,
+            lastError?.rawResponse,
+            lastError?.validationErrors
+        );
+    }
+
+    protected abstract getUserProfile(userId: UUID): Promise<{ reputation?: number; role?: string } | null>;
+    
+    protected abstract executeWithValidation<T extends Record<string, unknown>, R>(
+        operation: string,
+        params: T,
+        executor: (params: T) => Promise<R>
+    ): Promise<R>;
+
+    protected async getMemoriesWithFilter<T extends BaseContent>(
+        options: {
+            roomId: UUID;
+            count?: number;
+            unique?: boolean;
+            start?: number;
+            end?: number;
+            filter?: Record<string, unknown>;
+            lastId?: UUID;
+            createdAfter?: number;
+            createdBefore?: number;
+            updatedAfter?: number;
+            updatedBefore?: number;
+        }
+    ): Promise<Memory[]> {
+        return await this.runtime.messageManager.getMemories(options);
+    }
+
+    private startRequestTracking(): void {
+        // Load recently processed requests
+        this.loadProcessedRequests();
+
+        // Start cleanup interval
+        this.requestCleanupInterval = setInterval(() => {
+            this.cleanupProcessedRequests();
+        }, this.REQUEST_CLEANUP_INTERVAL);
+    }
+
+    private async loadProcessedRequests(): Promise<void> {
+        try {
+            const recentRequests = await this.getMemoriesWithFilter({
+                roomId: stringToUuid(this.id),
+                count: 1000,
+                filter: {
+                    type: "request_tracking",
+                    targetAgent: this.runtime.agentType
+                }
             });
 
-            return { key, holder: this.id, expiresAt, lockId };
-        } catch (error) {
-            elizaLogger.warn(`Failed to acquire lock for ${key}:`, error);
-            return null;
-        }
-    }
-
-    protected async releaseDistributedLock(lock: DistributedLock): Promise<void> {
-        try {
-            // Find and remove the lock record
-            const lockMemory = await this.runtime.messageManager.getMemoryById(
-                stringToUuid(`lock-${lock.key}-${lock.lockId}`)
-            );
-
-            if (lockMemory && lockMemory.content.holder === this.id) {
-                await this.runtime.messageManager.removeMemory(lockMemory.id);
-                elizaLogger.debug(`Released lock for ${lock.key}`);
+            // Load into local cache
+            for (const req of recentRequests) {
+                const tracking = req.content as RequestTracking;
+                if (tracking.requestStatus === "completed" || tracking.requestStatus === "failed") {
+                    this.processedRequests.add(tracking.requestId);
+                }
             }
         } catch (error) {
-            elizaLogger.error(`Error releasing lock for ${lock.key}:`, error);
+            elizaLogger.error("Error loading processed requests:", error);
         }
     }
 
-    private generateLockId(key: string): number {
-        return Math.abs(Array.from(key).reduce((hash, char) => {
-            return ((hash << 5) - hash) + char.charCodeAt(0);
-        }, 0));
+    private async cleanupProcessedRequests(): Promise<void> {
+        const now = Date.now();
+        const cutoff = now - (24 * 60 * 60 * 1000); // 24 hours
+
+        try {
+            const oldRequests = await this.getMemoriesWithFilter({
+                roomId: this.id,
+                filter: {
+                    type: "request_tracking",
+                    targetAgent: this.runtime.agentType,
+                    processedAt: { $lt: cutoff }
+                }
+            });
+
+            // Remove old requests from tracking
+            for (const req of oldRequests) {
+                const tracking = req.content as RequestTracking;
+                this.processedRequests.delete(tracking.requestId);
+            }
+        } catch (error) {
+            elizaLogger.error("Error cleaning up processed requests:", error);
+        }
+    }
+
+    protected async trackRequest(
+        requestId: UUID,
+        sourceType: string,
+        metadata?: Record<string, unknown>
+    ): Promise<void> {
+        const tracking: RequestTracking = {
+            type: "request_tracking",
+            id: stringToUuid(`tracking-${requestId}`),
+            requestId,
+            sourceType,
+            targetAgent: this.runtime.agentType,
+            requestStatus: "pending",
+            status: "pending_execution",  // Use standard ContentStatus
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            metadata,
+            text: `Request tracking for ${sourceType}`,
+            agentId: this.runtime.agentId
+        };
+
+        await this.runtime.messageManager.createMemory({
+            id: tracking.id,
+            content: tracking,
+            roomId: this.id,
+            userId: this.runtime.agentId,
+            agentId: this.runtime.agentId
+        });
+    }
+
+    protected async markRequestProcessing(requestId: UUID): Promise<void> {
+        await this.updateRequestStatus(requestId, "processing");
+    }
+
+    protected async markRequestComplete(
+        requestId: UUID,
+        metadata?: Record<string, unknown>
+    ): Promise<void> {
+        await this.updateRequestStatus(requestId, "completed", metadata);
+        this.processedRequests.add(requestId);
+    }
+
+    protected async markRequestFailed(
+        requestId: UUID,
+        error: string,
+        metadata?: Record<string, unknown>
+    ): Promise<void> {
+        await this.updateRequestStatus(requestId, "failed", { ...metadata, error });
+        this.processedRequests.add(requestId);
+    }
+
+    private async updateRequestStatus(
+        requestId: UUID,
+        requestStatus: RequestTracking["requestStatus"],
+        metadata?: Record<string, unknown>
+    ): Promise<void> {
+        const tracking = await this.getRequestTracking(requestId);
+        if (!tracking) return;
+
+        const updatedTracking: RequestTracking = {
+            ...tracking,
+            requestStatus,
+            status: requestStatus === "failed" ? "failed" : 
+                   requestStatus === "completed" ? "executed" :
+                   requestStatus === "processing" ? "executing" : "pending_execution",
+            processedAt: Date.now(),
+            updatedAt: Date.now(),
+            metadata: {
+                ...tracking.metadata,
+                ...metadata
+            }
+        };
+
+        await this.runtime.messageManager.createMemory({
+            id: tracking.id,
+            content: updatedTracking,
+            roomId: this.id,
+            userId: this.runtime.agentId,
+            agentId: this.runtime.agentId
+        });
+    }
+
+    private async getRequestTracking(requestId: UUID): Promise<RequestTracking | null> {
+        const memories = await this.getMemoriesWithFilter({
+            roomId: stringToUuid(this.id),
+            count: 1,
+            filter: {
+                type: "request_tracking",
+                requestId,
+                targetAgent: this.runtime.agentType
+            }
+        });
+
+        if (memories.length === 0) return null;
+        return memories[0].content as RequestTracking;
+    }
+
+    protected async hasProcessedRequest(requestId: UUID): Promise<boolean> {
+        // First check local cache
+        if (this.processedRequests.has(requestId)) {
+            return true;
+        }
+
+        // Then check database
+        const tracking = await this.getRequestTracking(requestId);
+        if (tracking && (tracking.requestStatus === "completed" || tracking.requestStatus === "failed")) {
+            this.processedRequests.add(requestId);
+            return true;
+        }
+
+        return false;
     }
 }

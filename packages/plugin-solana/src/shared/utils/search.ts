@@ -4,8 +4,8 @@ import {
     UUID,
     Memory
 } from "@elizaos/core";
-import { BaseContent } from "../types/base";
-import { ROOM_IDS, AGENT_IDS } from "../constants";
+import { BaseContent } from "../types/base.ts";
+import { ROOM_IDS, AGENT_IDS } from "../constants.ts";
 
 const DEFAULT_MEMORY_LIMIT = 500;
 

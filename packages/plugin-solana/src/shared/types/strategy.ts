@@ -1,8 +1,8 @@
 // packages/plugin-solana/src/shared/types/strategy.ts
 
 import { UUID } from "@elizaos/core";
-import { BaseContent, ContentStatus, MemoryMetadata } from "./base";
-import { DAOMemoryType } from "./memory";
+import { BaseContent, ContentStatus, MemoryMetadata } from "./base.ts";
+import { DAOMemoryType } from "./memory.ts";
 
 export type StrategyType = 
     | "TAKE_PROFIT"
@@ -25,6 +25,8 @@ export interface StrategyCondition {
     operator: ">" | "<" | "==" | ">=" | "<=";
     value: string;
     timeframe?: string;
+    action: "sell" | "buy";
+    amount: string;
 }
 
 export interface StrategyContent extends BaseContent {
@@ -65,6 +67,10 @@ export interface PositionUpdate extends BaseContent {
     price: string;
     size: string;
     value: string;
+    soldAmount?: string;
+    remainingAmount?: string;
+    sellType?: 'take_profit' | 'stop_loss';
+    txSignature?: string;
     pnl?: {
         percentage: string;
         absolute: string;
@@ -91,4 +97,40 @@ export interface StrategyExecutionResult extends BaseContent {
     error?: string;
     executedAmount?: string;
     executionPrice?: string;
+}
+
+export interface Position {
+    id: string;
+    txSignature: string;
+    token: string;
+    amount: number;
+    entryPrice: number;
+    timestamp: number;
+    strategy?: StrategyConfig;
+    status: 'active' | 'closed';
+    userId: string;
+    remainingAmount?: number;
+    partialSells?: Array<{
+        timestamp: number;
+        amount: number;
+        price: number;
+        type: 'take_profit' | 'stop_loss';
+        txSignature?: string;
+        profitPercentage?: number;
+    }>;
+}
+
+export interface StrategyConfig {
+    takeProfitLevels: Array<{
+        percentage: number;
+        sellAmount: number;
+        price?: number;
+    }>;
+    stopLoss?: {
+        percentage: number;
+        price?: number;
+        isTrailing?: boolean;
+        trailingDistance?: number;
+        highestPrice?: number;
+    };
 } 

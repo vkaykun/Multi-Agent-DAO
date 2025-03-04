@@ -13,9 +13,9 @@ import {
     ModelClass,
 } from "@elizaos/core";
 import { Connection } from "@solana/web3.js";
-import { getWalletKey } from "../keypairUtils.js";
-import { TokenProvider } from "../providers/token.js";
-import { WalletProvider } from "../providers/wallet.js";
+import { getWalletKey } from "../keypairUtils.ts";
+import { TokenProvider } from "../providers/token.ts";
+import { WalletProvider } from "../providers/wallet.ts";
 
 class TrustScoreManager {
     private tokenProvider: TokenProvider;

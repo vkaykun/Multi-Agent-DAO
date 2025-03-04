@@ -398,6 +398,9 @@ export interface Memory {
 
     /** Embedding similarity score */
     similarity?: number;
+
+    /** Memory type */
+    type?: string;
 }
 
 /**
@@ -1208,6 +1211,9 @@ export interface IDatabaseAdapter {
     clearKnowledge(agentId: UUID, shared?: boolean): Promise<void>;
 
     query(sql: string, params?: any[]): Promise<{ rows: any[] }>;
+
+    /** Update an existing memory */
+    updateMemory(memory: Memory, tableName: string): Promise<void>;
 }
 
 export interface IDatabaseCacheAdapter {
@@ -1249,6 +1255,7 @@ export interface IMemoryManager {
     getMemoriesByRoomIds(params: { roomIds: UUID[]; limit?: number; }): Promise<Memory[]>;
     searchMemoriesByEmbedding(embedding: number[], opts: { match_threshold?: number; count?: number; roomId: UUID; unique?: boolean; }): Promise<Memory[]>;
     createMemory(memory: Memory, unique?: boolean): Promise<void>;
+    updateMemory(memory: Memory): Promise<void>;
     removeMemory(memoryId: UUID): Promise<void>;
     removeAllMemories(roomId: UUID): Promise<void>;
     countMemories(roomId: UUID, unique?: boolean): Promise<number>;
@@ -1256,6 +1263,10 @@ export interface IMemoryManager {
     commitTransaction(): Promise<void>;
     rollbackTransaction(): Promise<void>;
     resyncDomainMemory(): Promise<void>;
+    subscribeToMemory(type: string, callback: (memory: Memory) => Promise<void>): void;
+    unsubscribeFromMemory(type: string, callback: (memory: Memory) => Promise<void>): void;
+    updateMemoryWithVersion(id: UUID, update: Partial<Memory>, expectedVersion: number): Promise<boolean>;
+    getLatestVersionWithLock(id: UUID): Promise<Memory | null>;
 }
 
 export interface IRAGKnowledgeManager {
@@ -1483,6 +1494,7 @@ export interface IAgentRuntime {
     serverUrl: string;
     databaseAdapter: IDatabaseAdapter;
     token: string | null;
+    discordToken?: string;
     modelProvider: ModelProviderName;
     imageModelProvider: ModelProviderName;
     imageVisionModelProvider: ModelProviderName;

@@ -1,6 +1,6 @@
 import { UUID, Content } from "@elizaos/core";
-import { BaseContent, ContentStatus, AgentType } from "./base";
-import { DAOMemoryType } from "./memory";
+import { BaseContent, ContentStatus, AgentType } from "./base.ts";
+import { DAOMemoryType } from "./memory.ts";
 
 export interface TokenBalance {
     token: string;
@@ -110,4 +110,15 @@ export interface PendingTransaction extends Content {
     expiresAt: number;
     createdAt: number;
     updatedAt: number;
+}
+
+export interface PendingWalletRegistration extends Content {
+    type: "pending_wallet_registration";
+    userId: UUID;
+    newWalletAddress: string;
+    existingWallets: Array<{ walletAddress: string; status: string }>;
+    expiresAt: number;
+    createdAt: number;
+    updatedAt: number;
+    status: ContentStatus;
 } 

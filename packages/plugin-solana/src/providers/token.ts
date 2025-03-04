@@ -17,13 +17,13 @@ import type {
     CalculatedBuyAmounts,
     Prices,
     TokenCodex,
-} from "../types/token.js";
+} from "../types/token.ts";
 import NodeCache from "node-cache";
 import * as path from "path";
-import { toBN } from "../bignumber.js";
-import { WalletProvider, type Item } from "./wallet.js";
+import { toBN } from "../bignumber.ts";
+import { WalletProvider, type Item } from "./wallet.ts";
 import { Connection } from "@solana/web3.js";
-import { getWalletKey } from "../keypairUtils.js";
+import { getWalletKey } from "../keypairUtils.ts";
 
 const PROVIDER_CONFIG = {
     BIRDEYE_API: "https://public-api.birdeye.so",

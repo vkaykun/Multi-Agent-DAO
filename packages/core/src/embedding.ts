@@ -4,6 +4,9 @@ import settings from "./settings.ts";
 import elizaLogger from "./logger.ts";
 import LocalEmbeddingModelManager from "./localembeddingManager.ts";
 
+// Global control to disable embeddings system-wide
+const DISABLE_EMBEDDINGS = process.env.DISABLE_EMBEDDINGS?.toLowerCase() === "true";
+
 interface EmbeddingOptions {
     model: string;
     endpoint: string;
@@ -11,7 +14,8 @@ interface EmbeddingOptions {
     length?: number;
     isOllama?: boolean;
     dimensions?: number;
-    provider?: string;
+    provider?: EmbeddingProviderType;
+    fallbackToZeroVector?: boolean;
 }
 
 export const EmbeddingProvider = {
@@ -78,6 +82,20 @@ async function getRemoteEmbedding(
     // Construct full URL
     const fullUrl = `${baseEndpoint}/embeddings`;
 
+    // Only include dimensions for non-OpenAI endpoints
+    const isOpenAI = options.provider === EmbeddingProvider.OpenAI || 
+                     options.endpoint.includes('openai.com');
+
+    const requestBody = {
+        input,
+        model: options.model,
+        ...(isOpenAI ? {} : {
+            dimensions: options.dimensions || 
+                       options.length || 
+                       getEmbeddingConfig().dimensions
+        })
+    };
+
     const requestOptions = {
         method: "POST",
         headers: {
@@ -88,36 +106,106 @@ async function getRemoteEmbedding(
                   }
                 : {}),
         },
-        body: JSON.stringify({
-            input,
-            model: options.model,
-            dimensions:
-                options.dimensions ||
-                options.length ||
-                getEmbeddingConfig().dimensions, // Prefer dimensions, fallback to length
-        }),
+        body: JSON.stringify(requestBody),
     };
 
-    try {
-        const response = await fetch(fullUrl, requestOptions);
+    // Log the request body for debugging
+    elizaLogger.debug("Embedding request body:", {
+        url: fullUrl,
+        body: requestBody,
+        isOpenAI
+    });
 
-        if (!response.ok) {
-            elizaLogger.error("API Response:", await response.text()); // Debug log
-            throw new Error(
-                `Embedding API Error: ${response.status} ${response.statusText}`
-            );
+    // Retry configuration
+    const MAX_RETRIES = 3;
+    const INITIAL_RETRY_DELAY = 1000; // 1 second
+
+    // Implement retry loop with exponential backoff
+    let lastError: Error | null = null;
+    
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+            const response = await fetch(fullUrl, requestOptions);
+
+            // Handle rate limiting specifically
+            if (response.status === 429) {
+                const retryAfterHeader = response.headers.get('retry-after');
+                const retryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : INITIAL_RETRY_DELAY * Math.pow(2, attempt);
+                
+                elizaLogger.warn(`Rate limit hit in embedding request (attempt ${attempt + 1}/${MAX_RETRIES}), retrying after ${retryAfter}ms`, {
+                    retryAfter,
+                    attempt: attempt + 1,
+                    maxRetries: MAX_RETRIES
+                });
+                
+                // Wait for the specified time
+                await new Promise(resolve => setTimeout(resolve, retryAfter));
+                continue; // Skip to next retry
+            }
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                elizaLogger.error("API Response:", errorText);
+                
+                // If we get a 5XX error or other temporary issue, retry
+                if (response.status >= 500 || response.status === 429) {
+                    const retryDelay = INITIAL_RETRY_DELAY * Math.pow(2, attempt);
+                    elizaLogger.warn(`Temporary error in embedding request (attempt ${attempt + 1}/${MAX_RETRIES}), retrying after ${retryDelay}ms`, {
+                        status: response.status,
+                        attempt: attempt + 1,
+                        maxRetries: MAX_RETRIES
+                    });
+                    
+                    await new Promise(resolve => setTimeout(resolve, retryDelay));
+                    continue; // Skip to next retry
+                }
+                
+                // For other errors, throw immediately
+                throw new Error(
+                    `Embedding API Error: ${response.status} ${response.statusText}`
+                );
+            }
+
+            interface EmbeddingResponse {
+                data: Array<{ embedding: number[] }>;
+            }
+
+            const data: EmbeddingResponse = await response.json();
+            
+            // Validate the response
+            const embedding = data?.data?.[0]?.embedding;
+            if (!Array.isArray(embedding)) {
+                throw new Error("Invalid embedding response format");
+            }
+
+            return embedding;
+        } catch (e) {
+            lastError = e as Error;
+            elizaLogger.error(`Embedding error (attempt ${attempt + 1}/${MAX_RETRIES}):`, {
+                error: e instanceof Error ? e.message : 'Unknown error',
+                attempt: attempt + 1,
+                maxRetries: MAX_RETRIES
+            });
+            
+            // If this is not the last attempt, wait and retry
+            if (attempt < MAX_RETRIES - 1) {
+                const retryDelay = INITIAL_RETRY_DELAY * Math.pow(2, attempt);
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+            }
         }
-
-        interface EmbeddingResponse {
-            data: Array<{ embedding: number[] }>;
-        }
-
-        const data: EmbeddingResponse = await response.json();
-        return data?.data?.[0].embedding;
-    } catch (e) {
-        elizaLogger.error("Full error details:", e);
-        throw e;
     }
+
+    // If we get here, all retries failed
+    elizaLogger.error("All embedding retries failed:", lastError);
+    
+    // As a last resort, return a zero vector instead of completely failing
+    if (options.fallbackToZeroVector) {
+        elizaLogger.warn("Falling back to zero vector for embedding");
+        return getEmbeddingZeroVector();
+    }
+    
+    // If fallback is not enabled, throw the last error
+    throw lastError || new Error("Failed to get embedding after multiple retries");
 }
 
 export function getEmbeddingType(runtime: IAgentRuntime): "local" | "remote" {
@@ -141,27 +229,9 @@ export function getEmbeddingType(runtime: IAgentRuntime): "local" | "remote" {
 }
 
 export function getEmbeddingZeroVector(): number[] {
-    let embeddingDimension = 384; // Default BGE dimension
-
-    if (settings.USE_OPENAI_EMBEDDING?.toLowerCase() === "true") {
-        embeddingDimension = getEmbeddingModelSettings(
-            ModelProviderName.OPENAI
-        ).dimensions; // OpenAI dimension
-    } else if (settings.USE_OLLAMA_EMBEDDING?.toLowerCase() === "true") {
-        embeddingDimension = getEmbeddingModelSettings(
-            ModelProviderName.OLLAMA
-        ).dimensions; // Ollama mxbai-embed-large dimension
-    } else if (settings.USE_GAIANET_EMBEDDING?.toLowerCase() === "true") {
-        embeddingDimension = getEmbeddingModelSettings(
-            ModelProviderName.GAIANET
-        ).dimensions; // GaiaNet dimension
-    } else if (settings.USE_HEURIST_EMBEDDING?.toLowerCase() === "true") {
-        embeddingDimension = getEmbeddingModelSettings(
-            ModelProviderName.HEURIST
-        ).dimensions; // Heurist dimension
-    }
-
-    return Array(embeddingDimension).fill(0);
+    // Use 1536-dimension vectors to match text-embedding-ada-002 embeddings
+    // This ensures compatibility with the current system configuration
+    return Array(1536).fill(0);
 }
 
 /**
@@ -180,6 +250,17 @@ export function getEmbeddingZeroVector(): number[] {
  */
 
 export async function embed(runtime: IAgentRuntime, input: string) {
+    // If embeddings are disabled, immediately return a zero vector without any processing
+    if (DISABLE_EMBEDDINGS) {
+        const zeroVector = getEmbeddingZeroVector();
+        elizaLogger.debug("Embeddings disabled, returning zero vector", {
+            input: input?.slice(0, 50) + "...",
+            zeroVectorSize: zeroVector.length,
+            dimensions: 1536 // Updated to reflect the actual dimensions
+        });
+        return zeroVector;
+    }
+    
     elizaLogger.debug("Embedding request:", {
         modelProvider: runtime.character.modelProvider,
         useOpenAI: process.env.USE_OPENAI_EMBEDDING,
@@ -197,15 +278,45 @@ export async function embed(runtime: IAgentRuntime, input: string) {
             type: typeof input,
             length: input?.length,
         });
-        return []; // Return empty embedding array
+        return getEmbeddingZeroVector(); // Return zero vector instead of empty array
     }
 
     // Check cache first
     const cachedEmbedding = await retrieveCachedEmbedding(runtime, input);
-    if (cachedEmbedding) return cachedEmbedding;
+    if (cachedEmbedding) {
+        if (!Array.isArray(cachedEmbedding) || cachedEmbedding.length !== 1536) {
+            elizaLogger.warn("Invalid cached embedding dimension:", {
+                isArray: Array.isArray(cachedEmbedding),
+                length: Array.isArray(cachedEmbedding) ? cachedEmbedding.length : 'not an array'
+            });
+            return getEmbeddingZeroVector();
+        }
+        return cachedEmbedding;
+    }
 
     const config = getEmbeddingConfig();
     const isNode = typeof process !== "undefined" && process.versions?.node;
+
+    // Force OpenAI embeddings if USE_OPENAI_EMBEDDING is true
+    if (settings.USE_OPENAI_EMBEDDING?.toLowerCase() === "true") {
+        const embedding = await getRemoteEmbedding(input, {
+            model: "text-embedding-ada-002", // Force OpenAI model
+            endpoint: settings.OPENAI_API_URL || "https://api.openai.com/v1",
+            apiKey: settings.OPENAI_API_KEY,
+            provider: EmbeddingProvider.OpenAI,
+            dimensions: 1536, // Force OpenAI dimensions
+            fallbackToZeroVector: true // Enable fallback to prevent crashes
+        });
+        
+        if (!Array.isArray(embedding) || embedding.length !== 1536) {
+            elizaLogger.error("Invalid OpenAI embedding dimension:", {
+                isArray: Array.isArray(embedding),
+                length: Array.isArray(embedding) ? embedding.length : 'not an array'
+            });
+            return getEmbeddingZeroVector();
+        }
+        return embedding;
+    }
 
     // Determine which embedding path to use
     if (config.provider === EmbeddingProvider.OpenAI) {
@@ -213,7 +324,9 @@ export async function embed(runtime: IAgentRuntime, input: string) {
             model: config.model,
             endpoint: settings.OPENAI_API_URL || "https://api.openai.com/v1",
             apiKey: settings.OPENAI_API_KEY,
+            provider: EmbeddingProvider.OpenAI,
             dimensions: config.dimensions,
+            fallbackToZeroVector: true
         });
     }
 
@@ -224,7 +337,9 @@ export async function embed(runtime: IAgentRuntime, input: string) {
                 runtime.character.modelEndpointOverride ||
                 getEndpoint(ModelProviderName.OLLAMA),
             isOllama: true,
+            provider: EmbeddingProvider.Ollama,
             dimensions: config.dimensions,
+            fallbackToZeroVector: true
         });
     }
 
@@ -238,7 +353,9 @@ export async function embed(runtime: IAgentRuntime, input: string) {
                 settings.MEDIUM_GAIANET_SERVER_URL ||
                 settings.LARGE_GAIANET_SERVER_URL,
             apiKey: settings.GAIANET_API_KEY || runtime.token,
+            provider: EmbeddingProvider.GaiaNet,
             dimensions: config.dimensions,
+            fallbackToZeroVector: true
         });
     }
 
@@ -247,7 +364,9 @@ export async function embed(runtime: IAgentRuntime, input: string) {
             model: config.model,
             endpoint: getEndpoint(ModelProviderName.HEURIST),
             apiKey: runtime.token,
+            provider: EmbeddingProvider.Heurist,
             dimensions: config.dimensions,
+            fallbackToZeroVector: true
         });
     }
 
@@ -270,7 +389,9 @@ export async function embed(runtime: IAgentRuntime, input: string) {
             runtime.character.modelEndpointOverride ||
             getEndpoint(runtime.character.modelProvider),
         apiKey: runtime.token,
+        provider: config.provider,
         dimensions: config.dimensions,
+        fallbackToZeroVector: true
     });
 
     async function getLocalEmbedding(input: string): Promise<number[]> {

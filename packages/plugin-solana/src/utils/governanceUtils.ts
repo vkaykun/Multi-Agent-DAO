@@ -1,15 +1,15 @@
 // packages/plugin-solana/src/utils/governanceUtils.ts
 
 import {
-    IAgentRuntime,
     elizaLogger,
     Memory
 } from "@elizaos/core";
-import { ProposalContent } from "../actions/propose.js";
-import { SwapService } from "../services/swapService.js";
-import { PositionTracker } from "../providers/positionTracker.js";
+import { IAgentRuntime } from "../shared/types/base.ts";
+import { ProposalContent } from "../shared/types/vote";
+import { SwapService } from "../services/swapService.ts";
+import { ExtendedAgentRuntime } from "../shared/utils/runtime.ts";
 
-const TOKEN_MINTS = {
+export const TOKEN_MINTS = {
     'SOL': 'So11111111111111111111111111111111111111112',
     'USDC': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
     'BONK': 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
@@ -52,6 +52,43 @@ export function validateActionCommand(
 
         const text = message.content.text.trim().toLowerCase();
         elizaLogger.debug(`Validating ${commandName} command:`, { text });
+        
+        // Special handling for tokeninfo to prevent false positives on casual conversation
+        if (commandName === "tokeninfo") {
+            // Exclude common greetings and conversational phrases
+            const conversationalPhrases = [
+                /^(?:hi|hey|hello|sup|yo|hru|how are you|how r u|what\'?s up|good morning|good afternoon|good evening|howdy)/i,
+                /^(?:thanks|thank you|ty|thx)/i,
+                /^(?:nice|cool|awesome|good|great)/i,
+                /^(?:lol|haha|hmm|um|hmm+|oh|ah|wow)/i,
+                /^(?:yes|no|maybe|sure|ok|okay)/i,
+                /^(?:can you|would you|could you|will you)/i,
+                /^(?:what do you think|tell me about|who are you)/i
+            ];
+            
+            // Check for common conversation starters - if found, return invalid
+            for (const phrase of conversationalPhrases) {
+                if (phrase.test(text)) {
+                    elizaLogger.debug(`Rejected tokeninfo for conversational phrase: ${text}`);
+                    return { isValid: false };
+                }
+            }
+            
+            // Require specific token-related patterns for tokeninfo
+            const tokenPatterns = [
+                /\b(?:price|cost|rate|value)\b.*?\b(?:of|for|on)\b/i,
+                /\b(?:volume|liquidity|market\s*cap|mcap|tvl)\b/i,
+                /\b(?:sol|btc|eth|usdc|usdt|bonk|jup|ray|msol)\b/i,
+                /\b[A-HJ-NP-Za-km-z1-9]{32,44}\b/i // Solana address pattern
+            ];
+            
+            // For tokeninfo, at least one token pattern must match
+            const hasTokenPattern = tokenPatterns.some(pattern => pattern.test(text));
+            if (!hasTokenPattern) {
+                elizaLogger.debug(`Rejected tokeninfo - no token pattern found: ${text}`);
+                return { isValid: false };
+            }
+        }
 
         const isCommandFormat = text.startsWith(`!${commandName}`) || text.startsWith(`/${commandName}`);
 
@@ -163,7 +200,10 @@ export async function executeSwapProposal(runtime: IAgentRuntime, proposal: Prop
             toToken
         });
 
-        const swapService = new SwapService(runtime);
+        if (!('memoryManagers' in runtime)) {
+            throw new Error('SwapService requires ExtendedAgentRuntime');
+        }
+        const swapService = new SwapService(runtime as unknown as ExtendedAgentRuntime);
 
         const fromTokenPrice = await swapService.getTokenPrice(fromToken);
         const toTokenPrice = await swapService.getTokenPrice(toToken);
@@ -319,34 +359,8 @@ export async function executeStrategyProposal(runtime: IAgentRuntime, proposal: 
             return false;
         }
 
-        const positionTracker = new PositionTracker(runtime);
-
-        const position = await positionTracker.getLatestPosition(runtime.agentId);
-        if (!position || position.token !== parsedStrategy.token) {
-            elizaLogger.error("No matching position found for token:", parsedStrategy.token);
-            return false;
-        }
-
-        const strategyConfig: StrategyConfig = {
-            takeProfitLevels: parsedStrategy.actions
-                .filter(a => a.type === 'take_profit')
-                .map(tp => ({
-                    percentage: tp.percentage,
-                    sellAmount: tp.sellAmount || 100,
-                    price: position.entryPrice * (1 + tp.percentage / 100)
-                })),
-            stopLoss: parsedStrategy.actions.find(a => a.type === 'stop_loss' || a.type === 'trailing_stop')
-                ? {
-                    percentage: parsedStrategy.actions.find(a => a.type === 'stop_loss' || a.type === 'trailing_stop')!.percentage,
-                    price: position.entryPrice * (1 - parsedStrategy.actions.find(a => a.type === 'stop_loss' || a.type === 'trailing_stop')!.percentage / 100),
-                    isTrailing: parsedStrategy.actions.find(a => a.type === 'trailing_stop') !== undefined,
-                    trailingDistance: parsedStrategy.actions.find(a => a.type === 'trailing_stop')?.percentage
-                }
-                : undefined
-        };
-
-        await positionTracker.attachStrategy(position, strategyConfig);
-        return true;
+        elizaLogger.warn("Strategy execution is currently disabled");
+        return false;
 
     } catch (error) {
         elizaLogger.error("Error executing strategy proposal:", error);

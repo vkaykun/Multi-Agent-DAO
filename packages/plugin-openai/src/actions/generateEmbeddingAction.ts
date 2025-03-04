@@ -1,3 +1,5 @@
+// packages/plugin-openai/src/actions/generateEmbeddingAction.ts
+
 import type { Action } from "@elizaos/core";
 import {
     validatePrompt,
@@ -25,7 +27,7 @@ export const generateEmbeddingAction: Action = {
             requestData,
             apiKey,
         ) as { data: Array<{ embedding: number[] }> };
-        return response.data.map((item: { embedding: number[] }) => item.embedding);
+        return response.data[0].embedding;
     },
     validate: async (runtime, _message) => {
         return !!runtime.getSetting("OPENAI_API_KEY");

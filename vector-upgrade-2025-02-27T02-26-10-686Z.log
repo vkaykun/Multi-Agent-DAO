@@ -1,0 +1,42 @@
+[2025-02-27T02:26:10.687Z] Starting vector dimension upgrade process
+[2025-02-27T02:26:10.690Z] Logs will be written to: /Users/vkay/velaaaa copy 2/vector-upgrade-2025-02-27T02-26-10-686Z.log
+[2025-02-27T02:26:10.690Z] ⚠️ Warning: Missing required environment variables: DATABASE_URL, OPENAI_API_KEY
+[2025-02-27T02:26:10.690Z] Please ensure these are set in your .env file or environment
+[2025-02-27T02:26:10.690Z] Executing upgrade script: upgrade-embeddings.js
+[2025-02-27T02:26:10.745Z] [stderr] (node:77398) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///Users/vkay/velaaaa%20copy%202/upgrade-embeddings.js is not specified and it doesn't parse as CommonJS.
+[2025-02-27T02:26:10.745Z] [stderr] Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+[2025-02-27T02:26:10.745Z] [stderr] To eliminate this warning, add "type": "module" to /Users/vkay/velaaaa copy 2/package.json.
+[2025-02-27T02:26:10.745Z] [stderr] (Use `node --trace-warnings ...` to show where the warning was created)
+[2025-02-27T02:26:10.795Z] [stdout] Connecting to database...
+[2025-02-27T02:26:10.798Z] [stderr] (node:77398) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+[2025-02-27T02:26:10.804Z] [stdout] Checking database connection...
+[2025-02-27T02:26:10.807Z] [stdout] pgvector extension version: 0.8.0
+[2025-02-27T02:26:10.807Z] [stdout] Finding embeddings with dimension 384...
+[2025-02-27T02:26:10.808Z] [stdout] Error using array_length function, trying alternative approach
+[2025-02-27T02:26:10.808Z] [stderr] error: function array_length(vector, integer) does not exist
+[2025-02-27T02:26:10.808Z] [stderr]     at /Users/vkay/velaaaa copy 2/node_modules/pg/lib/client.js:535:17
+[2025-02-27T02:26:10.808Z] [stderr]     at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+[2025-02-27T02:26:10.808Z] [stderr]     at async findMismatchedEmbeddings (file:///Users/vkay/velaaaa%20copy%202/upgrade-embeddings.js:143:22)
+[2025-02-27T02:26:10.808Z] [stderr]     at async fixDimensionMismatches (file:///Users/vkay/velaaaa%20copy%202/upgrade-embeddings.js:261:32) {
+[2025-02-27T02:26:10.808Z] [stderr]   length: 222,
+[2025-02-27T02:26:10.808Z] [stderr]   severity: 'ERROR',
+[2025-02-27T02:26:10.808Z] [stderr]   code: '42883',
+[2025-02-27T02:26:10.808Z] [stderr]   detail: undefined,
+[2025-02-27T02:26:10.808Z] [stderr]   hint: 'No function matches the given name and argument types. You might need to add explicit type casts.',
+[2025-02-27T02:26:10.808Z] [stderr]   position: '21',
+[2025-02-27T02:26:10.808Z] [stderr]   internalPosition: undefined,
+[2025-02-27T02:26:10.808Z] [stderr]   internalQuery: undefined,
+[2025-02-27T02:26:10.808Z] [stderr]   where: undefined,
+[2025-02-27T02:26:10.808Z] [stderr]   schema: undefined,
+[2025-02-27T02:26:10.808Z] [stderr]   table: undefined,
+[2025-02-27T02:26:10.808Z] [stderr]   column: undefined,
+[2025-02-27T02:26:10.808Z] [stderr]   dataType: undefined,
+[2025-02-27T02:26:10.808Z] [stderr]   constraint: undefined,
+[2025-02-27T02:26:10.808Z] [stderr]   file: 'parse_func.c',
+[2025-02-27T02:26:10.808Z] [stderr]   line: '636',
+[2025-02-27T02:26:10.808Z] [stderr]   routine: 'ParseFuncOrColumn'
+[2025-02-27T02:26:10.808Z] [stderr] }
+[2025-02-27T02:26:10.813Z] [stdout] Found 0 memories with mismatched dimensions out of 5 checked
+[2025-02-27T02:26:10.814Z] [stdout] No dimension mismatches found. Exiting.
+[2025-02-27T02:26:10.821Z] ✅ Upgrade completed successfully
+[2025-02-27T02:26:10.821Z] Vector dimension upgrade process completed
