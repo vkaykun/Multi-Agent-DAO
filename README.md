@@ -1,5 +1,7 @@
 # Vela-v1
 
+![vela](https://github.com/user-attachments/assets/a9c6cf09-4f96-473b-9ed0-e41e4d3f1cea)
+
 A distributed multi-agent system for fully autonomous DAO operations on Solana, featuring specialized agents for treasury management, autonomous trading, strategy execution, coupled with a reputation-based governance framework for proposal creation, voting, and automated execution of passed proposals. The system supports consensus mechanisms such as liquid democracy and quadratic voting for decision making, and reputation-based weighted voting. Agents communicate through an event-driven subscription system, where each agent subscribes to specific memory types through a centralized registry. The DAO operates within discord and is best described as a 'cybernetic corp-like entity in a box'
 
 This project is a fork of [ElizaOS](https://github.com/elizaOS/eliza) with modifications to the existing Solana plugin.
