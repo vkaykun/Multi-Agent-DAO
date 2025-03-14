@@ -198,4 +198,4 @@ packages/plugin-solana/src/
 └── ...
 ```
 
-This project is built on top of [https://github.com/elizaOS/eliza] with significant modifications to the core framework.
+This project is built on top of [ElizaOS](https://github.com/elizaOS/eliza) with significant modifications to the core framework.
