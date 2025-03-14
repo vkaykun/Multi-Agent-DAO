@@ -18,7 +18,6 @@ A distributed multi-agent system for autonomous DAO operations, featuring specia
   - [Subscription Registry](#subscription-registry)
   - [BaseAgent and Shared Types](#baseagent-and-shared-types)
 - [Scripts / Entry Points](#scripts--entry-points)
-  - [startVela.ts](###e.g.-startVela.ts-(TreasuryAgent))
 - [Communication Flow](#communication-flow-example-for-treasuryAgent):
 - [How to Run Locally](#how-to-run-locally)
 - [Directory Structure](#directory-structure)
