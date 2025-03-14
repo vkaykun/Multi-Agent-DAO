@@ -143,7 +143,6 @@ There are four main script files, each starting one of the specialized agents:
 6. Any changes are stored as new Memory records (proposal_created, vote_cast, strategy_execution_request, etc.).
 7. The MemorySyncManager replicates the event to other processes if in multi-process mode.
 8. Other agents listen to relevant memory types, e.g., the StrategyAgent might see a proposal_passed memory, or the ProposalAgent sees a vote_cast.
-9. The agents may handoff and coordinate specific data, e.g. 
 
 ## How to Run Locally
 ### Install dependencies
