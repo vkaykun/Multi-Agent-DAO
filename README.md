@@ -1,98 +1,206 @@
-# Vela-v1
+# Vela v1
 
-<img width="984" alt="vela1" src="https://github.com/user-attachments/assets/f50a6ada-16a7-45f0-8c6c-28079ee05c0a" />
+<img width="984" alt="vela1" src="https://github.com/user-attachments/assets/bdbd883e-fee4-4bfb-927a-e2b6bb6b1029" />
 
-A distributed multi-agent system for fully autonomous DAO operations on Solana, featuring specialized agents for treasury management, autonomous trading, and strategy execution, coupled with a governance framework for proposal creation, voting, and automated execution of passed proposals. The system supports consensus mechanisms such as liquid democracy and quadratic voting, and employs weighted voting and reputation systems based on user contributions. Agents communicate through an event-driven subscription system, where each agent subscribes to specific memory types through a centralized registry. The DAO operates within discord and is best described as a 'cybernetic corp-like entity in a box'.
+A distributed multi-agent system for autonomous DAO operations, featuring specialized agents who orchestrate treasury management, autonomous trading, and strategy execution, coupled with a governance framework for proposal creation, weighted voting, and automated execution of passed proposals. Agents communicate through an event-driven subscription system and unified ephemeral memory layer where each agent subscribes to memory types through a centralized subscription registry. The DAO *currently* operates within discord and allows users to interact with agents via natural language. The system is best described as a 'cybernetic-corp like entity in a box' and aims to progressively realize this concept by merging various protocols and 'network pieces' into a self-organizing human-machine network.
 
-This project is a fork of [ElizaOS](https://github.com/elizaOS/eliza) with modifications to the Solana plugin.
+## Table of Contents
+- [Architecture](#architecture)
+- [Agents](#agents)
+  - [ProposalAgent (Pion)](#proposalagent-pion)
+  - [StrategyAgent (Kron)](#strategyagent-kron)
+  - [TreasuryAgent (Vela)](#treasuryagent-vela)
+  - [UserProfileAgent (Nova)](#userprofileagent-nova)
+- [Core Components](#core-components)
+  - [MemoryManager & ExtendedMemoryManager](#memorymanager--extendedmemorymanager)
+  - [MemorySyncManager](#memorysyncmanager)
+  - [MessageBroker](#messagebroker)
+  - [Subscription Registry](#subscription-registry)
+  - [BaseAgent and Shared Types](#baseagent-and-shared-types)
+- [Scripts / Entry Points](#scripts--entry-points)
+  - [startVela.ts](#startvelets-treasuryagent)
+- [Communication Flow](#communication-flow)
+- [How to Run Locally](#how-to-run-locally)
+- [Directory Structure](#directory-structure)
 
-## Agents:
+The four primary agents in this system are ProposalAgent (Pion), StrategyAgent (Kron), TreasuryAgent (Vela), and UserProfileAgent (Nova).
 
-Vela (Treasury Agent)
+Key points:
 
-* Manages treasury through TEE-controlled wallet: deposits, withdrawals, and token swaps.
-* Automatically executes treasury-related decisions once proposals pass.
+- Each agent is an instance of the BaseAgent class.
+- MemoryManager + MessageBroker + MemorySyncManager provide a robust communication and storage system.
+- Agents are run in separate processes, each connecting to a Postgres DB and via cross-process messages.
+- A subscription registry ensures each agent only receives relevant memory updates.
 
-Pion (Governance Agent)
+## Agents
 
-* Oversees proposal creation and voting.
-* Collects weighted votes (based on Nova’s reputation system).
-* Finalizes proposals (open → closed → executed or rejected) and enforces quorum/threshold rules.
+### TreasuryAgent (Vela)
+File: packages/plugin-solana/src/agents/treasury/TreasuryAgent.ts
 
-Kron (Strategy Agent)
+Key Features:
 
-* Parses natural-language trading/yield strategies (e.g., “take profit at 20%”).
-* Monitors markets and triggers trade signals when conditions are met.
-* Signals are sent to the Vela agent to execute trades.
+- Core Treasury operations: user registration, treasury deposits, transfers, token swaps (upon community consensus).
+- Agents TEE-controlled wallet acts as a 'treasury'.
+- Serves as the bridge between on-chain actions and the rest of the DAO.
 
-Nova (User Profile Agent)
+### ProposalAgent (Pion)
+File: packages/plugin-solana/src/agents/proposal/ProposalAgent.ts
 
-* Maintains user profiles, reputation points, and voting weights.
-* Adjusts reputation for contributions and various DAO-defined criteria.
-* Supplies weighted voting data to Pion for governance decisions.
+Key Features:
+
+- Creates new proposals with unique IDs by interpreting user requests, validating input, and scheduling votes.
+- Auto-detects user votes from messages "yes/no" or emoji reactions '✅'.
+- Monitors and manages the entire proposal lifecycle: open → pending_execution → executing → executed or failed.
+- TreasuryAgent or strategyAgent automatically execute passed proposals when quorum is reached (e.g., parameter changes or governance actions).
+- Uses DistributedLock to avoid concurrent updates on the same proposal.
 
 
-## Memory Architecture
+### StrategyAgent (Kron)
+File: packages/plugin-solana/src/agents/strategy/StrategyAgent.ts
 
-* Universal memory space with typed content and room-based partitioning
-* "Global DAO Rooms" for shared state between agents
-* Cross-process memory convergence via MemorySyncManager
-* Transaction-based state transitions with ACID guarantees
+Key Features:
 
-### Subscription Registry
-* Centralized registry (`SUBSCRIPTION_REGISTRY`) mapping agent types to memory event types
-* Enables cross-agent communication through memory event subscriptions
-* Defines required memory types each agent must handle (e.g., TreasuryAgent subscribes to `swap_request`, `deposit_received`, etc.)
+- Manages advanced trading strategies for tokens, e.g.:
+- Take-profit (TP) levels, stop-loss (SL), trailing stop, DCA, grids, rebalancing.
+- Position tracking: opens or updates positions based on user instructions or proposals.
+- treasuryAgent triggers token swaps when conditions are met as dictated by the strategyAgent (e.g., price threshold).
+- Users simply define a strategy in natural language for a [articular open trade (e.g. set a take profit at 30% for position 'X').
+
+
+### UserProfileAgent (Nova)
+File: packages/plugin-solana/src/agents/user/UserProfileAgent.ts
+
+Key Features:
+
+- Manages user profiles, reputations, preferences, tasks, and other conversation-based data.
+- Modular to support various goverance mechanisms and quorum rules; liquid democracy, quadratic voting.
+- Can handle user-level permission checks, roles (admin, moderator, user).
+
+## Core Components
+
+### MemoryManager & ExtendedMemoryManager
+Files:
+
+- packages/plugin-solana/src/shared/memory/BaseMemoryManager.ts
+- packages/plugin-solana/src/shared/utils/runtime.ts (where ExtendedMemoryManager is constructed)
+
+Function:
+
+- Provides read/write operations for storing Memory objects in a database.
+- Handles "versioned" memory types (like proposals) and unique memory constraints.
+- Agents rely on it to createMemory, getMemories, subscribeToMemory, etc.
+- ExtendedMemoryManager is a specialized overlay that enriches the base memory manager with additional logic like locks, concurrency checks, or advanced search.
+
+### MemorySyncManager
+File: packages/plugin-solana/src/shared/memory/MemorySyncManager.ts
+
+Function:
+
+- Synchronizes memory changes across multiple processes.
+- Listens for create/update/delete events and replicates them, ensuring all agent processes share consistent state.
+- Uses inter-process messaging (process.send in Node.js) or a custom bus mechanism.
 
 ### MessageBroker
-* Implements publisher-subscriber pattern for local event broadcasting
-* Ensures reliable delivery of DAO events to all interested agents
+File: packages/plugin-solana/src/shared/MessageBroker.ts
 
-## State Machines
+Function:
 
-### Memory
+- A local event emitter that broadcasts memory events to in-process subscribers.
+- Agents subscribe to memory types (e.g., "proposal_created"), and the MessageBroker routes relevant events.
+- Works in tandem with MemorySyncManager for cross-process broadcasting.
+
+### Subscription Registry
+File:
+
+- packages/plugin-solana/src/shared/types/subscriptionRegistry.ts
+- packages/plugin-solana/src/shared/types/memory-subscriptions.ts
+
+Function:
+
+- Enumerates which memory types each agent must subscribe to. E.g., the ProposalAgent must subscribe to vote_cast, proposal_created, etc.
+- Ensures an agent only handles the relevant memory events, thereby simplifying the logic.
+
+### BaseAgent and Shared Types
+File: packages/plugin-solana/src/shared/BaseAgent.ts
+
+Key Elements:
+
+- BaseAgent is the abstract class providing common functionality:
+  - Lifecycle methods: initialize(), shutdown().
+  - Transaction helpers: withTransaction().
+  - Subscriptions, cross-process event hooking.
+- AgentMessage, BaseContent, Room IDs, DistributedLock interfaces are also defined in types/base.ts.
+
+## Scripts / Entry Points
+There are four main script files, each starting one of the specialized agents:
+
+### e.g. startVela.ts (TreasuryAgent)
+- Path: packages/plugin-solana/src/startVela.ts
+- Bootstraps the TreasuryAgent to handle all treasury-related commands (deposits, swaps, balance checks, etc.).
+
+## Communication Flow Example (for treasuryAgent):
+1. User types in chat (e.g., "i want to register my wallet <addresss>", "how do i deposit?", "i propose we swap 20 SOL for USDC".
+2. Agents capture the a Memory of type user_message.
+3. MemoryManager triggers a local event → MessageBroker broadcasts → The agent responsible for that memory type picks it up.
+4. E.g., if the message is a deposit command, TreasuryAgent sees it and processes it.
+5. The agent performs logic (maybe a swap, a deposit verification, or schedule a proposal).
+6. Any changes are stored as new Memory records (proposal_created, vote_cast, strategy_execution_request, etc.).
+7. The MemorySyncManager replicates the event to other processes if in multi-process mode.
+8. Other agents listen to relevant memory types, e.g., the StrategyAgent might see a proposal_passed memory, or the ProposalAgent sees a vote_cast.
+9. The agents may handoff and coordinate specific data, e.g. 
+
+## How to Run Locally
+### Install dependencies
 ```bash
-EPHEMERAL → PERSISTENT → ARCHIVED
+npm install
 ```
 
-### Content
+### Set environment variables
+- Copy .env.example to .env and fill in Solana or DB credentials.
+- Create specialized .env files for each agent each agent.
+
+### Run an agent
+Example: to start the TreasuryAgent (Vela):
 ```bash
-DRAFT → PENDING → EXECUTED | FAILED
+ts-node packages/plugin-solana/src/startVela.ts
+```
+or the ProposalAgent (Pion):
+```bash
+ts-node packages/plugin-solana/src/startPion.ts
 ```
 
-### Process
-```bash
-INIT → ACTIVE → MONITORING → TERMINATED
+### Multi-process
+Simply run each script in a separate terminal (or a process manager). The MemorySyncManager will keep them in sync if MULTI_PROCESS=true.
+
+## Directory Structure (High-Level)
+```
+packages/plugin-solana/src/
+├── agents/
+│   ├── proposal/
+│   │   └── ProposalAgent.ts      # Pion
+│   ├── strategy/
+│   │   └── StrategyAgent.ts      # Kron
+│   ├── treasury/
+│   │   └── TreasuryAgent.ts      # Vela
+│   └── user/
+│       └── UserProfileAgent.ts   # Nova
+├── shared/
+│   ├── memory/
+│   │   ├── BaseMemoryManager.ts
+│   │   ├── MemorySyncManager.ts
+│   │   └── ...
+│   ├── types/
+│   │   ├── base.ts
+│   │   ├── memory-subscriptions.ts
+│   │   ├── subscriptionRegistry.ts
+│   │   └── ...
+│   ├── MessageBroker.ts
+│   └── ...
+├── startPion.ts       # Boot script for ProposalAgent
+├── startKron.ts       # Boot script for StrategyAgent
+├── startVela.ts       # Boot script for TreasuryAgent
+├── startNova.ts       # Boot script for UserProfileAgent
+└── ...
 ```
 
-## Implementation
-
-### Core Dependencies
-
-* Node.js 23.3.0
-* PostgreSQL
-* Solana CLI
-* pnpm 9.15.0
-
-### Runtime Configuration
-
-```bash
-# Agent-specific environment initialization for specialized agents
-cp packages/plugin-solana/.env.example packages/plugin-solana/.env.[agent]
-
-# DB initialization
-createdb dao_dev
-pnpm run migrate
-```
-
-### Process Initialization
-
-```bash
-# Distributed process startup across multiple agents
-pnpm run start:vela
-pnpm run start:kron
-pnpm run start:pion
-pnpm run start:nova
-```
-
-
+This project is built on top of [https://github.com/elizaOS/eliza] with significant modifications to the core framework.
