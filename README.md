@@ -21,7 +21,7 @@ A distributed multi-agent system for autonomous DAO operations, featuring specia
   - [startVela.ts](#startvelets-treasuryagent)
 - [Communication Flow](#communication-flow-example-for-treasuryAgent):
 - [How to Run Locally](#how-to-run-locally)
-- [Directory Structure](#directory-structure-(high-level))
+- [Directory Structure](#directory-structure (High Level))
 
 The four primary agents in this system are ProposalAgent (Pion), StrategyAgent (Kron), TreasuryAgent (Vela), and UserProfileAgent (Nova).
 
