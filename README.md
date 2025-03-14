@@ -35,7 +35,6 @@ Key points:
 ## Agents
 
 ### TreasuryAgent (Vela)
-File: packages/plugin-solana/src/agents/treasury/TreasuryAgent.ts
 
 Key Features:
 
@@ -44,7 +43,6 @@ Key Features:
 - Serves as the bridge between on-chain actions and the rest of the DAO.
 
 ### ProposalAgent (Pion)
-File: packages/plugin-solana/src/agents/proposal/ProposalAgent.ts
 
 Key Features:
 
@@ -56,7 +54,6 @@ Key Features:
 
 
 ### StrategyAgent (Kron)
-File: packages/plugin-solana/src/agents/strategy/StrategyAgent.ts
 
 Key Features:
 
@@ -68,7 +65,6 @@ Key Features:
 
 
 ### UserProfileAgent (Nova)
-File: packages/plugin-solana/src/agents/user/UserProfileAgent.ts
 
 Key Features:
 
