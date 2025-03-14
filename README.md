@@ -21,7 +21,7 @@ A distributed multi-agent system for autonomous DAO operations, featuring specia
   - [startVela.ts](#startvelets-treasuryagent)
 - [Communication Flow](#communication-flow-example-for-treasuryAgent):
 - [How to Run Locally](#how-to-run-locally)
-- [Directory Structure](#directory-structure-(High Level))
+- [Directory Structure](#directory-structure)
 
 The four primary agents in this system are ProposalAgent (Pion), StrategyAgent (Kron), TreasuryAgent (Vela), and UserProfileAgent (Nova).
 
@@ -167,7 +167,7 @@ ts-node packages/plugin-solana/src/startPion.ts
 ### Multi-process
 Simply run each script in a separate terminal (or a process manager). The MemorySyncManager will keep them in sync if MULTI_PROCESS=true.
 
-## Directory Structure (High Level)
+## Directory Structure
 ```
 packages/plugin-solana/src/
 ├── agents/
