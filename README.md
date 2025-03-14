@@ -49,7 +49,7 @@ Key Features:
 - Creates new proposals with unique IDs by interpreting user requests, validating input, and scheduling votes.
 - Auto-detects user votes from messages "yes/no" or emoji reactions '✅'.
 - Monitors and manages the entire proposal lifecycle: open → pending_execution → executing → executed or failed.
-- TreasuryAgent or strategyAgent automatically execute passed proposals when quorum is reached (e.g., parameter changes or governance actions).
+- TreasuryAgent or strategyAgent automatically execute passed proposals when quorum is reached.
 - Uses DistributedLock to avoid concurrent updates on the same proposal.
 
 
