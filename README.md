@@ -68,7 +68,7 @@ Key Features:
 Key Features:
 
 - Manages user profiles, reputations, preferences, tasks, and other conversation-based data.
-- Modular to support various goverance mechanisms and quorum rules; liquid democracy, quadratic voting.
+- Modular to support various goverance mechanisms and quorum rules such as liquid democracy, quadratic voting, etc.
 - Can handle user-level permission checks, roles (admin, moderator, user).
 
 ## Core Components
