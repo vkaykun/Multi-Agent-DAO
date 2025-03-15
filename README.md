@@ -60,7 +60,7 @@ Key Features:
 - Take-profit (TP) levels, stop-loss (SL), trailing stop, DCA, grids, rebalancing.
 - Position tracking: opens or updates positions based on user instructions or proposals.
 - treasuryAgent triggers token swaps when conditions are met as dictated by the strategyAgent (e.g., price threshold).
-- Users simply define a strategy in natural language for a [articular open trade (e.g. set a take profit at 30% for position 'X').
+- Users simply define a strategy in natural language for a particular open trade (e.g. set a take profit at 30% for position 'X').
 
 
 ### UserProfileAgent (Nova)
