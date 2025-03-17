@@ -48,7 +48,7 @@ Key Features:
 - Creates new proposals with unique IDs by interpreting user requests, validating input, and scheduling votes.
 - Auto-detects user votes from messages "yes/no" or emoji reactions '✅'.
 - Monitors and manages the entire proposal lifecycle: open → pending_execution → executing → executed or failed.
-- TreasuryAgent or strategyAgent automatically execute passed proposals when quorum is reached.
+- TreasuryAgent or StrategyAgent automatically execute passed proposals when quorum is reached.
 - Uses DistributedLock to avoid concurrent updates on the same proposal.
 
 
@@ -59,7 +59,7 @@ Key Features:
 - Manages advanced trading strategies for tokens, e.g.:
 - Take-profit (TP) levels, stop-loss (SL), trailing stop, DCA, grids, rebalancing.
 - Position tracking: opens or updates positions based on user instructions or proposals.
-- treasuryAgent triggers token swaps when conditions are met as dictated by the strategyAgent (e.g., price threshold).
+- TreasuryAgent triggers token swaps when conditions are met as dictated by the strategyAgent (e.g., price threshold).
 - Users simply define a strategy in natural language for a particular open trade (e.g. set a take profit at 30% for position 'X').
 
 
