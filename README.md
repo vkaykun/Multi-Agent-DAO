@@ -126,6 +126,15 @@ Key Elements:
   - Subscriptions, cross-process event hooking.
 - AgentMessage, BaseContent, Room IDs, DistributedLock interfaces are also defined in types/base.ts.
 
+### Advanced Concurrency and Locking
+
+- **DistributedLock** objects (stored as memory entries) to ensure that no two agents simultaneously modify critical data (e.g., a proposal, a treasury balance).  
+- **Versioned memory types**: For certain records (like proposals) that require linear updates and potential rollback or conflict checks.  
+- **Nested transactions** and concurrency** checks** in `withTransaction()`, so if a memory update fails partway through, the system can roll back.  
+
+---
+
+
 ## Scripts / Entry Points
 There are four main script files, each starting one of the specialized agents:
 
@@ -134,7 +143,7 @@ There are four main script files, each starting one of the specialized agents:
 - Bootstraps the TreasuryAgent to handle all treasury-related commands (deposits, swaps, balance checks, etc.).
 
 ## Communication Flow Example (for treasuryAgent):
-1. User types in chat (e.g., "i want to register my wallet <addresss>", "how do i deposit?", "i propose we swap 20 SOL for USDC".
+1. User types in chat (e.g., "i want to register my wallet <addresss>", "how do i make a deposit to the treasury?", "create a proposal for >swap 20 SOL for USDC".
 2. Agents capture the a Memory of type user_message.
 3. MemoryManager triggers a local event → MessageBroker broadcasts → The agent responsible for that memory type picks it up.
 4. E.g., if the message is a deposit command, TreasuryAgent sees it and processes it.
