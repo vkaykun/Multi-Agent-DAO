@@ -1,7 +1,3 @@
-# Vela v1
-
-<img width="980" alt="Vela_v1" src="https://github.com/user-attachments/assets/6cea6d1a-84a5-4739-bc15-af397dc299ba" />
-
 A distributed multi-agent system for autonomous DAO operations, featuring specialized agents who orchestrate treasury management, autonomous trading, and strategy execution, coupled with a governance framework for proposal creation, weighted voting, and automated execution of passed proposals. Agents communicate through an event-driven subscription system and unified ephemeral memory layer where each agent subscribes to memory types through a subscription registry. The DAO *currently* operates within discord and allows users to interact with agents via natural language. The system is best described as a 'cybernetic corp-like entity in a box' and aims to progressively realize this concept by merging various protocols and 'network pieces' into a self-organizing human-machine network.
 
 ## Table of Contents
